@@ -1,0 +1,4710 @@
+import json
+import base64
+from django.shortcuts import render, redirect
+from django.contrib.auth import authenticate, login, logout
+from django.contrib.auth.decorators import login_required
+from django.contrib.auth import get_user_model
+from django.contrib import messages
+from django.http import JsonResponse, HttpResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.utils import timezone
+import pytz
+from django.db.models import Count
+from datetime import datetime, timedelta
+from .models import User, Role, LocationConstraint, AttendanceSession, AttendanceRecord, MonthlyReport
+from .forms import CustomUserCreationForm
+from .utils import encode_face, base64_to_image, compare_faces, send_attendance_email, is_live_capture
+import numpy as np
+import face_recognition
+
+
+User = get_user_model()
+
+def home(request):
+    """Home page view"""
+    return render(request, 'face/home.html')
+
+def login_view(request):
+    """User login view"""
+    if request.method == 'POST':
+        roll_number = request.POST['roll_number']
+        password = request.POST['password']
+        
+        user = authenticate(request, username=roll_number, password=password)
+        
+        if user is not None:
+            login(request, user)
+            # Redirect to unified dashboard for all users
+            return redirect('face:unified_dashboard')
+        else:
+            messages.error(request, 'Invalid roll number or password.')
+    
+    return render(request, 'face/login.html')
+
+def logout_view(request):
+    """User logout view"""
+    logout(request)
+    messages.info(request, 'You have been logged out.')
+    return redirect('face:login')
+
+@login_required
+def unified_dashboard(request):
+    """Unified dashboard for all roles"""
+    # Get active attendance session if exists
+    active_session = AttendanceSession.objects.filter(is_active=True).first()
+    
+    context = {
+        'user': request.user,
+        'active_session': active_session,
+    }
+    return render(request, 'face/unified_dashboard.html', context)
+
+@login_required
+def admin_dashboard(request):
+    """Admin dashboard view"""
+    # Only allow admin users
+    if not (request.user.role and request.user.role.name.lower() == 'admin'):
+        messages.error(request, 'Access denied. Administrator privileges required.')
+        return redirect('face:unified_dashboard')
+    
+    # Get statistics
+    total_users = User.objects.count()
+    total_sessions = AttendanceSession.objects.count()
+    active_sessions = AttendanceSession.objects.filter(is_active=True).count()
+    total_attendance_records = AttendanceRecord.objects.count()
+    
+    # Get recent attendance records
+    recent_records = AttendanceRecord.objects.select_related('user', 'session').order_by('-timestamp')[:10]
+    
+    # Get active session
+    active_session = AttendanceSession.objects.filter(is_active=True).first()
+    
+    context = {
+        'total_users': total_users,
+        'total_sessions': total_sessions,
+        'active_sessions': active_sessions,
+        'total_attendance_records': total_attendance_records,
+        'recent_records': recent_records,
+        'active_session': active_session,
+    }
+    return render(request, 'face/admin_dashboard.html', context)
+
+@login_required
+def hod_dashboard(request):
+    """HOD dashboard view"""
+    # Check if user has HOD role
+    if not (request.user.role and request.user.role.name.lower() == 'hod'):
+        messages.error(request, 'Access denied. HOD privileges required.')
+        return redirect('face:unified_dashboard')
+    
+    # Get statistics for HOD
+    department_users = User.objects.filter(role__name='student').count()
+    today = timezone.now().date()
+    start_of_month = today.replace(day=1)
+    
+    # Get attendance records for current month
+    monthly_records = AttendanceRecord.objects.filter(
+        timestamp__date__gte=start_of_month,
+        timestamp__date__lte=today
+    ).count()
+    
+    # Get faculty members and their session counts
+    from django.db.models import Count
+    faculty_members = User.objects.filter(role__name='faculty').annotate(
+        session_count=Count('faculty_sessions')
+    )
+    faculty_count = faculty_members.count()
+    
+    # Get recent attendance records for all faculty in the department
+    faculty_users = User.objects.filter(role__name='faculty')
+    faculty_sessions = AttendanceSession.objects.filter(faculty__in=faculty_users)
+    recent_records = AttendanceRecord.objects.filter(
+        session__in=faculty_sessions
+    ).select_related('user', 'session').order_by('-timestamp')[:10]
+    
+    context = {
+        'user': request.user,
+        'department_users': department_users,
+        'monthly_records': monthly_records,
+        'faculty_members': faculty_members,
+        'faculty_count': faculty_count,
+        'recent_records': recent_records,
+    }
+    return render(request, 'face/hod_dashboard.html', context)
+
+@login_required
+def faculty_dashboard(request):
+    """Faculty dashboard view"""
+    # Check if user has faculty role
+    if not (request.user.role and request.user.role.name.lower() == 'faculty'):
+        messages.error(request, 'Access denied. Faculty privileges required.')
+        return redirect('face:unified_dashboard')
+    
+    # Get statistics for faculty
+    faculty_students = User.objects.filter(role__name='student').count()
+    today = timezone.now().date()
+    
+    # Get today's attendance records
+    today_records = AttendanceRecord.objects.filter(
+        timestamp__date=today
+    ).count()
+    
+    # Get faculty's sessions
+    faculty_sessions = AttendanceSession.objects.filter(faculty=request.user)
+    faculty_sessions_count = faculty_sessions.count()
+    
+    # Get recent attendance records for this faculty's sessions
+    recent_records = AttendanceRecord.objects.filter(
+        session__in=faculty_sessions
+    ).select_related('user', 'session').order_by('-timestamp')[:10]
+    
+    context = {
+        'user': request.user,
+        'faculty_students': faculty_students,
+        'today_records': today_records,
+        'faculty_sessions': faculty_sessions.order_by('-start_time')[:5],  # Last 5 sessions
+        'faculty_sessions_count': faculty_sessions_count,
+        'recent_records': recent_records,
+    }
+    return render(request, 'face/faculty_dashboard.html', context)
+
+@login_required
+def principal_dashboard(request):
+    """Principal dashboard view"""
+    # Get overall statistics
+    total_users = User.objects.count()
+    total_sessions = AttendanceSession.objects.count()
+    today = timezone.now().date()
+    start_of_month = today.replace(day=1)
+    
+    # Get monthly attendance records
+    monthly_records = AttendanceRecord.objects.filter(
+        timestamp__date__gte=start_of_month,
+        timestamp__date__lte=today
+    ).count()
+    
+    # Get recent attendance records
+    recent_records = AttendanceRecord.objects.select_related('user', 'session').order_by('-timestamp')[:10]
+    
+    # Calculate attendance percentage
+    total_possible_attendance = total_users * total_sessions
+    if total_possible_attendance > 0:
+        attendance_percentage = (monthly_records / total_possible_attendance) * 100
+    else:
+        attendance_percentage = 0
+    
+    context = {
+        'user': request.user,
+        'total_users': total_users,
+        'total_sessions': total_sessions,
+        'monthly_records': monthly_records,
+        'attendance_percentage': attendance_percentage,
+        'recent_records': recent_records,
+    }
+    return render(request, 'face/principal_dashboard.html', context)
+
+@login_required
+def mark_attendance(request):
+    """Mark attendance view"""
+    # Check if there's an active session
+    active_session = AttendanceSession.objects.filter(is_active=True).first()
+    
+    if not active_session:
+        messages.info(request, 'No active attendance session. Please wait for the admin to start a session.')
+        return redirect('face:unified_dashboard')
+    
+    # Check if user has already marked attendance for this session
+    if AttendanceRecord.objects.filter(user=request.user, session=active_session).exists():
+        messages.info(request, 'You have already marked attendance for this session.')
+        return redirect('face:unified_dashboard')
+    
+    # Check if user has registered their face
+    if not request.user.face_encoding:
+        messages.info(request, 'Please register your face before marking attendance.')
+        return redirect('face:register_face')
+    
+    # Get active location constraints
+    locations = LocationConstraint.objects.filter(is_active=True)
+    
+    context = {
+        'locations': locations,
+        'active_session': active_session,
+    }
+    return render(request, 'face/mark_attendance.html', context)
+
+@csrf_exempt
+@login_required
+def process_attendance(request):
+    """Process attendance with facial recognition"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        data = json.loads(request.body)
+        image_data = data.get('image')
+        latitude = data.get('latitude')
+        longitude = data.get('longitude')
+        
+        if not image_data:
+            return JsonResponse({'success': False, 'message': 'No image data provided'})
+        
+        # Check if there's an active session
+        active_session = AttendanceSession.objects.filter(is_active=True).first()
+        if not active_session:
+            return JsonResponse({'success': False, 'message': 'No active attendance session. Please wait for the admin to start a session.'})
+        
+        # Check if user has already marked attendance for this session
+        if AttendanceRecord.objects.filter(user=request.user, session=active_session).exists():
+            return JsonResponse({'success': False, 'message': 'You have already marked attendance for this session.'})
+        
+        # Check if user has registered their face
+        if not request.user.face_encoding:
+            return JsonResponse({'success': False, 'message': 'Please register your face before marking attendance.'})
+        
+        # Remove data URL prefix if present
+        if image_data.startswith('data:image'):
+            image_data = image_data.split(',')[1]
+        
+        # Convert base64 to image
+        image = base64_to_image(image_data)
+        
+        # Encode face in captured image
+        unknown_encoding = encode_face(image)
+        
+        if unknown_encoding is None:
+            return JsonResponse({'success': False, 'message': 'No face detected in the image'})
+        
+        # Get user's stored face encoding
+        if not request.user.face_encoding:
+            return JsonResponse({'success': False, 'message': 'No face registered for this user'})
+        
+        # Convert stored encoding back to numpy array
+        known_encoding = np.frombuffer(base64.b64decode(request.user.face_encoding), dtype=np.float64)
+        
+        # Compare faces
+        match = compare_faces(known_encoding, unknown_encoding)
+        
+        if not match:
+            return JsonResponse({'success': False, 'message': 'Face does not match registered face'})
+        
+        # Check location constraints
+        if latitude and longitude:
+            # Check if the user's location is within the active session's location constraint
+            location = active_session.location_constraint
+            distance = calculate_distance(
+                float(latitude), float(longitude),
+                float(location.latitude), float(location.longitude)
+            )
+            
+            # Check if distance is within the allowed radius
+            if distance > float(location.radius):
+                return JsonResponse({
+                    'success': False, 
+                    'message': f'You are not within the allowed location for attendance. Distance: {distance:.2f}m, Allowed: {location.radius}m'
+                })
+        
+        # Create attendance record
+        attendance_record = AttendanceRecord.objects.create(
+            user=request.user,
+            session=active_session,
+            latitude=float(latitude) if latitude else None,
+            longitude=float(longitude) if longitude else None,
+            verification_method='face'
+        )
+        
+        # Send attendance confirmation email
+        from .utils import send_attendance_email
+        send_attendance_email(request.user, attendance_record)
+        
+        return JsonResponse({
+            'success': True, 
+            'message': 'Attendance marked successfully!',
+            'timestamp': attendance_record.timestamp.isoformat()
+        })
+        
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error processing attendance: {str(e)}'})
+
+@login_required
+def register_face(request):
+    """Register user's face for facial recognition"""
+    if request.method == 'POST':
+        try:
+            image_data = request.POST.get('image')
+            
+            if not image_data:
+                return JsonResponse({'success': False, 'message': 'No image data provided'})
+            
+            # Remove data URL prefix if present
+            if image_data.startswith('data:image'):
+                image_data = image_data.split(',')[1]
+            
+            # Convert base64 to image
+            image = base64_to_image(image_data)
+            
+            # Debug: Print image information
+            print(f"Received image shape: {image.shape if hasattr(image, 'shape') else 'Unknown'}")
+            print(f"Received image type: {type(image)}")
+            
+            # Encode face
+            face_encoding = encode_face(image)
+            
+            if face_encoding is None:
+                # Try to detect faces with different methods for better error reporting
+                import face_recognition
+                import cv2
+                
+                # Convert to RGB if needed
+                if len(image.shape) == 3:
+                    rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                else:
+                    rgb_image = image
+                
+                # Try different detection methods
+                face_locations_hog = face_recognition.face_locations(rgb_image, model="hog")
+                face_locations_cnn = face_recognition.face_locations(rgb_image, model="cnn")
+                face_locations_upsample = face_recognition.face_locations(rgb_image, number_of_times_to_upsample=2)
+                
+                error_details = []
+                if not face_locations_hog:
+                    error_details.append("HOG model found no faces")
+                else:
+                    error_details.append(f"HOG model found {len(face_locations_hog)} face(s)")
+                
+                if not face_locations_cnn:
+                    error_details.append("CNN model found no faces")
+                else:
+                    error_details.append(f"CNN model found {len(face_locations_cnn)} face(s)")
+                
+                if not face_locations_upsample:
+                    error_details.append("Upsampled detection found no faces")
+                else:
+                    error_details.append(f"Upsampled detection found {len(face_locations_upsample)} face(s)")
+                
+                detailed_message = f"No face detected in the image. Please try again with better lighting and positioning. Details: {', '.join(error_details)}"
+                return JsonResponse({'success': False, 'message': detailed_message})
+            
+            # Convert numpy array to bytes for storage
+            encoding_bytes = face_encoding.tobytes()
+            encoding_b64 = base64.b64encode(encoding_bytes).decode()
+            
+            # Save to user profile
+            request.user.face_encoding = encoding_b64
+            request.user.save()
+            
+            return JsonResponse({'success': True, 'message': 'Face registered successfully!'})
+            
+        except Exception as e:
+            # Log the error for debugging
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Error registering face: {str(e)}", exc_info=True)
+            return JsonResponse({'success': False, 'message': f'Error registering face: {str(e)}'})
+    
+    return render(request, 'face/register_face.html')
+
+@login_required
+def view_attendance(request):
+    """View attendance records"""
+    # Get attendance records for the user
+    records = AttendanceRecord.objects.filter(user=request.user).order_by('-timestamp')
+    
+    context = {
+        'records': records,
+    }
+    return render(request, 'face/view_attendance.html', context)
+
+@login_required
+def location_constraint(request):
+    """Location constraint management"""
+    # Only allow admin users
+    if not (request.user.role and request.user.role.name.lower() == 'admin'):
+        messages.error(request, 'Access denied. Administrator privileges required.')
+        return redirect('face:unified_dashboard')
+    
+    if request.method == 'POST':
+        # Handle manual location creation
+        name = request.POST.get('name')
+        latitude = request.POST.get('latitude')
+        longitude = request.POST.get('longitude')
+        radius = request.POST.get('radius')
+        is_active = request.POST.get('is_active') == 'on'
+        
+        if not all([name, latitude, longitude, radius]):
+            messages.error(request, 'All fields are required.')
+        else:
+            try:
+                # Convert string values to Decimal
+                from decimal import Decimal
+                latitude_decimal = Decimal(latitude)
+                longitude_decimal = Decimal(longitude)
+                radius_decimal = Decimal(radius)
+                
+                LocationConstraint.objects.create(
+                    name=name,
+                    latitude=latitude_decimal,
+                    longitude=longitude_decimal,
+                    radius=radius_decimal,
+                    is_active=is_active
+                )
+                messages.success(request, f'Location constraint "{name}" created successfully.')
+            except Exception as e:
+                messages.error(request, f'Error creating location constraint: {str(e)}')
+    
+    locations = LocationConstraint.objects.all()
+    
+    context = {
+        'locations': locations,
+    }
+    return render(request, 'face/location_constraint.html', context)
+
+@login_required
+def set_location_constraint(request):
+    """Set location constraint using admin's current location"""
+    # Only allow admin users
+    if not (request.user.role and request.user.role.name.lower() == 'admin'):
+        messages.error(request, 'Access denied. Administrator privileges required.')
+        return redirect('face:unified_dashboard')
+    
+    if request.method == 'POST':
+        name = request.POST.get('name')
+        latitude = request.POST.get('latitude')
+        longitude = request.POST.get('longitude')
+        radius = request.POST.get('radius')
+        
+        if not all([name, latitude, longitude, radius]):
+            messages.error(request, 'All fields are required.')
+            return render(request, 'face/set_location.html')
+        
+        try:
+            # Convert string values to Decimal
+            from decimal import Decimal
+            latitude_decimal = Decimal(latitude)
+            longitude_decimal = Decimal(longitude)
+            radius_decimal = Decimal(radius)
+            
+            # Create location constraint
+            location = LocationConstraint.objects.create(
+                name=name,
+                latitude=latitude_decimal,
+                longitude=longitude_decimal,
+                radius=radius_decimal,
+                is_active=True
+            )
+            
+            messages.success(request, f'Location constraint "{location.name}" created successfully.')
+            return redirect('face:location_constraint')
+            
+        except Exception as e:
+            messages.error(request, f'Error creating location constraint: {str(e)}')
+    
+    return render(request, 'face/set_location.html')
+
+@login_required
+def manage_users(request):
+    """Manage users"""
+    # Only allow admin users
+    if not (request.user.role and request.user.role.name.lower() == 'admin' or request.user.role.name.lower() == 'hod'):
+        messages.error(request, 'Access denied. Administrator privileges required.')
+        return redirect('face:unified_dashboard')
+    
+    users = User.objects.all()
+    
+    context = {
+        'users': users,
+    }
+    return render(request, 'face/manage_users.html', context)
+
+@login_required
+def create_user(request):
+    """Create new user"""
+    # Only allow admin users
+    if not (request.user.role and request.user.role.name.lower() == 'admin' or request.user.role.name.lower() == 'hod'):
+        messages.error(request, 'Access denied. Administrator privileges required.')
+        return redirect('face:unified_dashboard')
+    
+    if request.method == 'POST':
+        form = CustomUserCreationForm(request.POST)
+        if form.is_valid():
+            user = form.save()
+            messages.success(request, f'User {user.roll_number} created successfully.')
+            return redirect('face:manage_users')
+        else:
+            messages.error(request, 'Please correct the errors below.')
+    else:
+        form = CustomUserCreationForm()
+    
+    context = {
+        'form': form,
+    }
+    return render(request, 'face/create_user.html', context)
+
+@login_required
+def manage_sessions(request):
+    """Manage attendance sessions"""
+    # Only allow admin users
+    if not (request.user.role and request.user.role.name.lower() == 'admin'):
+        messages.error(request, 'Access denied. Administrator privileges required.')
+        return redirect('face:unified_dashboard')
+    
+    sessions = AttendanceSession.objects.all().order_by('-start_time')
+    
+    context = {
+        'sessions': sessions,
+    }
+    return render(request, 'face/manage_sessions.html', context)
+
+@login_required
+def create_session(request):
+    """Create new attendance session"""
+    # Only allow admin users
+    if not (request.user.role and request.user.role.name.lower() == 'admin'):
+        messages.error(request, 'Access denied. Administrator privileges required.')
+        return redirect('face:unified_dashboard')
+    
+    if request.method == 'POST':
+        name = request.POST.get('name')
+        location_id = request.POST.get('location')
+        duration = int(request.POST.get('duration', 60))  # Default 60 minutes
+        
+        try:
+            location = LocationConstraint.objects.get(id=location_id)
+            
+            # Create session (not active by default)
+            session = AttendanceSession.objects.create(
+                name=name,
+                location_constraint=location,
+                start_time=timezone.now(),
+                end_time=timezone.now() + timedelta(minutes=duration),
+                is_active=False
+            )
+            
+            messages.success(request, f'Session "{session.name}" created successfully.')
+            return redirect('face:manage_sessions')
+            
+        except LocationConstraint.DoesNotExist:
+            messages.error(request, 'Invalid location selected.')
+        except Exception as e:
+            messages.error(request, f'Error creating session: {str(e)}')
+    
+    # Get active locations
+    locations = LocationConstraint.objects.filter(is_active=True)
+    
+    context = {
+        'locations': locations,
+    }
+    return render(request, 'face/create_session_new.html', context)
+
+@login_required
+def start_session(request, session_id):
+    """Start an attendance session"""
+    # Only allow admin users
+    if not (request.user.role and request.user.role.name.lower() == 'admin'):
+        messages.error(request, 'Access denied. Administrator privileges required.')
+        return redirect('face:unified_dashboard')
+    
+    try:
+        session = AttendanceSession.objects.get(id=session_id)
+        session.is_active = True
+        session.start_time = timezone.now()  # Reset start time
+        session.end_time = timezone.now() + (session.end_time - session.start_time)  # Adjust end time
+        session.save()
+        
+        messages.success(request, f'Session "{session.name}" started successfully.')
+    except AttendanceSession.DoesNotExist:
+        messages.error(request, 'Session not found.')
+    
+    return redirect('face:manage_sessions')
+
+@login_required
+def stop_session(request, session_id):
+    """Stop an attendance session"""
+    # Only allow admin users
+    if not (request.user.role and request.user.role.name.lower() == 'admin'):
+        messages.error(request, 'Access denied. Administrator privileges required.')
+        return redirect('face:unified_dashboard')
+    
+    try:
+        session = AttendanceSession.objects.get(id=session_id)
+        session.is_active = False
+        session.end_time = timezone.now()  # Set end time when stopping session
+        session.save()
+        
+        messages.success(request, f'Session "{session.name}" stopped successfully.')
+    except AttendanceSession.DoesNotExist:
+        messages.error(request, 'Session not found.')
+    
+    return redirect('face:manage_sessions')
+
+@csrf_exempt
+def api_get_user_monthly_reports(request):
+    """API endpoint to get user's monthly reports"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Get all monthly reports for the user
+        from .models import MonthlyReport
+        reports = MonthlyReport.objects.filter(user=request.user).order_by('-month')
+        
+        reports_data = []
+        for report in reports:
+            reports_data.append({
+                'id': report.id,
+                'month': report.month.strftime('%Y-%m'),
+                'month_display': report.month.strftime('%B %Y'),
+                'total_sessions': report.total_sessions,
+                'attended_sessions': report.attended_sessions,
+                'attendance_percentage': float(report.attendance_percentage)
+            })
+        
+        return JsonResponse({
+            'success': True,
+            'reports': reports_data
+        })
+        
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+@login_required
+def delete_session(request, session_id):
+    """Delete an attendance session"""
+    # Only allow admin users
+    if not (request.user.role and request.user.role.name.lower() == 'admin'):
+        messages.error(request, 'Access denied. Administrator privileges required.')
+        return redirect('face:unified_dashboard')
+    
+    try:
+        session = AttendanceSession.objects.get(id=session_id)
+        session_name = session.name
+        session.delete()
+        messages.success(request, f'Session "{session_name}" deleted successfully.')
+    except AttendanceSession.DoesNotExist:
+        messages.error(request, 'Session not found.')
+    except Exception as e:
+        messages.error(request, f'Error deleting session: {str(e)}')
+    
+    return redirect('face:manage_sessions')
+
+@csrf_exempt
+@login_required
+def delete_location_constraint(request, location_id):
+    """Delete a location constraint"""
+    # Only allow admin users
+    if not (request.user.role and request.user.role.name.lower() == 'admin' or request.user.role.name.lower() == 'faculty' ):
+        messages.error(request, 'Access denied. Administrator privileges required.')
+        return redirect('face:unified_dashboard')
+    
+    try:
+        location = LocationConstraint.objects.get(id=location_id)
+        location_name = location.name
+        location.delete()
+        messages.success(request, f'Location constraint "{location_name}" deleted successfully.')
+    except LocationConstraint.DoesNotExist:
+        messages.error(request, 'Location constraint not found.')
+    except Exception as e:
+        messages.error(request, f'Error deleting location constraint: {str(e)}')
+    
+    return redirect('face:location_constraint')
+
+@csrf_exempt
+def api_delete_session(request, session_id):
+    """API endpoint for admin to delete an attendance session"""
+    if request.method != 'DELETE':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has admin role
+        if not (request.user.role and request.user.role.name.lower() == 'admin'):
+            return JsonResponse({'success': False, 'message': 'Administrator privileges required'})
+        
+        # Get the session
+        try:
+            session = AttendanceSession.objects.get(id=session_id)
+            session_name = session.name
+            session.delete()
+            
+            return JsonResponse({
+                'success': True, 
+                'message': f'Session "{session_name}" deleted successfully'
+            })
+        except AttendanceSession.DoesNotExist:
+            return JsonResponse({'success': False, 'message': 'Session not found'})
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_delete_location_constraint(request, location_id):
+    """API endpoint for admin to delete a location constraint"""
+    if request.method != 'DELETE':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has admin role
+        if not (request.user.role and request.user.role.name.lower() == 'admin' or request.user.role.name.lower() == 'faculty'):
+            return JsonResponse({'success': False, 'message': 'Administrator privileges required'})
+        
+        # Get the location constraint
+        try:
+            location = LocationConstraint.objects.get(id=location_id)
+            location_name = location.name
+            location.delete()
+            
+            return JsonResponse({
+                'success': True, 
+                'message': f'Location constraint "{location_name}" deleted successfully'
+            })
+        except LocationConstraint.DoesNotExist:
+            return JsonResponse({'success': False, 'message': 'Location constraint not found'})
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_login(request):
+    """API endpoint for user login"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        data = json.loads(request.body)
+        roll_number = data.get('roll_number')
+        password = data.get('password')
+        first_name = data.get('first_name')
+        last_name = data.get('last_name')
+        year = data.get('year')
+        department = data.get('department')
+        level = data.get('level')  # Add level parameter
+        
+        if not roll_number or not password:
+            return JsonResponse({'success': False, 'message': 'Roll number and password are required'})
+        
+        user = authenticate(request, username=roll_number, password=password)
+        
+        if user is not None:
+            # For students, verify the additional information
+            if user.role and user.role.name.lower() == 'student':
+                # Check if additional information is provided
+                if first_name and last_name and year and department and level:
+                    # Verify that the provided information matches the stored information
+                    if (user.first_name != first_name or 
+                        user.last_name != last_name or 
+                        user.year != year or 
+                        user.department != department or
+                        user.level != level):  # Add level check
+                        return JsonResponse({'success': False, 'message': 'Student information does not match. Please check your details.'})
+                else:
+                    return JsonResponse({'success': False, 'message': 'Student information is required for login.'})
+            
+            login(request, user)
+            return JsonResponse({
+                'success': True,
+                'message': 'Login successful',
+                'user': {
+                    'id': user.id,
+                    'roll_number': user.roll_number,
+                    'email': user.email,
+                    'first_name': user.first_name,
+                    'last_name': user.last_name,
+                    'role': user.role.name if user.role else None,
+                    'year': user.year,
+                    'department': user.department,
+                    'level': user.level,  # Add level to response
+                }
+            })
+        else:
+            return JsonResponse({'success': False, 'message': 'Invalid credentials'})
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_register_face(request):
+    """API endpoint for registering user's face"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        data = json.loads(request.body)
+        image_data = data.get('image')
+        
+        if not image_data:
+            return JsonResponse({'success': False, 'message': 'Image data is required'})
+        
+        # Remove data URL prefix if present
+        if image_data.startswith('data:image'):
+            image_data = image_data.split(',')[1]
+        
+        # Convert base64 to image
+        image = base64_to_image(image_data)
+        
+        if image is None:
+            return JsonResponse({'success': False, 'message': 'Invalid image data'})
+        
+        # Check if image is from a live camera (not a static photo)
+        # This is a basic check - in a production environment, you might want more sophisticated methods
+        if not is_live_capture(image):
+            return JsonResponse({'success': False, 'message': 'Only live face capture is allowed. Static images, photos of screens, or blurry images are not permitted. Please use the device camera directly.'})
+        
+        # Encode face
+        face_encoding = encode_face(image)
+        
+        if face_encoding is None:
+            return JsonResponse({'success': False, 'message': 'No face detected in the image. Please try again with better lighting and positioning.'})
+        
+        # Debug: Check encoding shape
+        print(f"Face encoding shape: {face_encoding.shape}")
+        
+        # Check if this face is already registered by another user with stricter tolerance
+        existing_users = User.objects.exclude(id=request.user.id).exclude(face_encoding__isnull=True).exclude(face_encoding='')
+        for user in existing_users:
+            try:
+                # Convert stored encoding back to numpy array
+                known_encoding = np.frombuffer(base64.b64decode(user.face_encoding), dtype=np.float64)
+                
+                # Ensure both encodings have the same shape
+                if known_encoding.shape != face_encoding.shape:
+                    continue  # Skip this user if shapes don't match
+                
+                # Compare faces with a stricter tolerance for registration
+                match = compare_faces(known_encoding, face_encoding, tolerance=0.4)
+                
+                if match:
+                    return JsonResponse({
+                        'success': False, 
+                        'message': f'This face is already registered to another user ({user.roll_number}). Each face can only be registered once.'
+                    })
+            except Exception as e:
+                # Continue checking other users if there's an error with one
+                continue
+        
+        # Convert numpy array to bytes for storage
+        encoding_bytes = face_encoding.tobytes()
+        encoding_b64 = base64.b64encode(encoding_bytes).decode()
+        
+        # Save face encoding and image to user profile
+        request.user.face_encoding = encoding_b64
+        request.user.face_image = image_data  # Store the image data
+        request.user.save()
+        
+        return JsonResponse({'success': True, 'message': 'Face registered successfully!'})
+        
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error registering face: {str(e)}")
+        print(f"Traceback: {error_details}")
+        return JsonResponse({'success': False, 'message': f'Error registering face: {str(e)}'})
+
+@csrf_exempt
+def api_mark_attendance(request):
+    """API endpoint for marking attendance"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        data = json.loads(request.body)
+        image_data = data.get('image')
+        latitude = data.get('latitude')
+        longitude = data.get('longitude')
+        session_id = data.get('session_id')  # Add session ID parameter
+        
+        # Debug logging
+        print(f"API Mark Attendance called with session_id: {session_id}")
+        
+        if not image_data:
+            return JsonResponse({'success': False, 'message': 'Image data is required'})
+        
+        # Check if session ID is provided
+        if not session_id:
+            return JsonResponse({'success': False, 'message': 'Session ID is required'})
+        
+        # Get the specified session
+        try:
+            active_session = AttendanceSession.objects.get(id=session_id, is_active=True)
+            # Debug logging
+            print(f"Found session: ID={active_session.id}, Name={active_session.name}, Start={active_session.start_time}, End={active_session.end_time}")
+        except AttendanceSession.DoesNotExist:
+            print(f"Session not found or not active: session_id={session_id}")
+            return JsonResponse({'success': False, 'message': 'No active attendance session found with the provided ID.'})
+        
+        # Check if user has already marked attendance for this session
+        attendance_exists = AttendanceRecord.objects.filter(user=request.user, session=active_session).exists()
+        print(f"Attendance check: user={request.user.roll_number}, session_id={session_id}, exists={attendance_exists}")
+        if attendance_exists:
+            return JsonResponse({'success': False, 'message': 'You have already marked attendance for this session.'})
+        
+        # Check if user has registered their face
+        if not request.user.face_encoding:
+            return JsonResponse({'success': False, 'message': 'Please register your face before marking attendance.'})
+        
+        # Remove data URL prefix if present
+        if image_data.startswith('data:image'):
+            image_data = image_data.split(',')[1]
+        
+        # Convert base64 to image
+        image = base64_to_image(image_data)
+        
+        if image is None:
+            return JsonResponse({'success': False, 'message': 'Invalid image data'})
+        
+        # Enhanced liveness detection to prevent spoofing
+        if not is_live_capture(image):
+            return JsonResponse({'success': False, 'message': 'Only live face capture is allowed. Static images, photos of screens, or blurry images are not permitted. Please use the device camera directly and ensure good lighting.'})
+        
+        # Encode face in captured image
+        unknown_encoding = encode_face(image)
+        
+        if unknown_encoding is None:
+            return JsonResponse({'success': False, 'message': 'No face detected in the image. Please try again with better lighting and positioning.'})
+        
+        # Get user's stored face encoding
+        if not request.user.face_encoding:
+            return JsonResponse({'success': False, 'message': 'No face registered for this user'})
+        
+        # Convert stored encoding back to numpy array
+        try:
+            known_encoding = np.frombuffer(base64.b64decode(request.user.face_encoding), dtype=np.float64)
+        except Exception as e:
+            return JsonResponse({'success': False, 'message': 'Error decoding stored face data. Please re-register your face.'})
+        
+        # Debug: Check shapes of encodings
+        print(f"Known encoding shape: {known_encoding.shape}")
+        print(f"Unknown encoding shape: {unknown_encoding.shape}")
+        
+        # Ensure both encodings have the same shape
+        if known_encoding.shape != unknown_encoding.shape:
+            return JsonResponse({'success': False, 'message': f'Face encoding mismatch. Stored: {known_encoding.shape}, Captured: {unknown_encoding.shape}. Please re-register your face.'})
+        
+        # Compare faces with stricter tolerance
+        match = compare_faces(known_encoding, unknown_encoding, tolerance=0.4)
+        
+        if not match:
+            # Calculate distance for debugging
+            try:
+                face_distances = face_recognition.face_distance([known_encoding], unknown_encoding)
+                distance = face_distances[0] if len(face_distances) > 0 else 1.0
+                return JsonResponse({'success': False, 'message': f'Face does not match registered face. Distance: {distance:.4f}, Threshold: 0.4. Please ensure you are the registered user.'})
+            except Exception as e:
+                return JsonResponse({'success': False, 'message': f'Error comparing faces: {str(e)}. Please try again.'})
+        
+        # Check location constraints
+        if latitude and longitude and active_session.location_constraint:
+            location = active_session.location_constraint
+            distance = calculate_distance(
+                float(latitude), float(longitude),
+                float(location.latitude), float(location.longitude)
+            )
+            
+            # Check if distance is within the allowed radius
+            if distance > float(location.radius):
+                return JsonResponse({
+                    'success': False, 
+                    'message': f'You are not within the allowed location for attendance. Distance: {distance:.2f}m, Allowed: {location.radius}m'
+                })
+        
+        # Create attendance record
+        attendance_record = AttendanceRecord.objects.create(
+            user=request.user,
+            session=active_session,
+            latitude=float(latitude) if latitude else None,
+            longitude=float(longitude) if longitude else None,
+            verification_method='face'
+        )
+        
+        # Send attendance confirmation email
+        from .utils import send_attendance_email
+        send_attendance_email(request.user, attendance_record)
+        
+        return JsonResponse({
+            'success': True, 
+            'message': 'Attendance marked successfully!',
+            'timestamp': attendance_record.timestamp.isoformat()
+        })
+        
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error processing attendance: {str(e)}")
+        print(f"Traceback: {error_details}")
+        return JsonResponse({'success': False, 'message': f'Error processing attendance: {str(e)}'})
+
+@csrf_exempt
+def api_faculty_mark_attendance(request):
+    """API endpoint for faculty to mark attendance without face recognition"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has faculty or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['faculty', 'admin']:
+            return JsonResponse({'success': False, 'message': 'Faculty or Administrator privileges required'})
+        
+        data = json.loads(request.body)
+        student_roll_number = data.get('student_roll_number')
+        session_id = data.get('session_id')
+        latitude = data.get('latitude')
+        longitude = data.get('longitude')
+        
+        if not all([student_roll_number, session_id]):
+            return JsonResponse({'success': False, 'message': 'Student roll number and session ID are required'})
+        
+        # Get the specified session
+        try:
+            active_session = AttendanceSession.objects.get(id=session_id, is_active=True)
+        except AttendanceSession.DoesNotExist:
+            return JsonResponse({'success': False, 'message': 'No active attendance session found with the provided ID.'})
+        
+        # Check if faculty is authorized to access this session
+        if user_role == 'faculty' and active_session.faculty != request.user:
+            return JsonResponse({'success': False, 'message': 'You are not authorized to mark attendance for this session.'})
+        
+        # Get the student user
+        try:
+            student_user = User.objects.get(roll_number=student_roll_number)
+        except User.DoesNotExist:
+            return JsonResponse({'success': False, 'message': 'Student not found with the provided roll number.'})
+        
+        # Check if student has already marked attendance for this session
+        if AttendanceRecord.objects.filter(user=student_user, session=active_session).exists():
+            return JsonResponse({'success': False, 'message': f'Student {student_roll_number} has already marked attendance for this session.'})
+        
+        # Check location constraints for faculty
+        if latitude and longitude and active_session.location_constraint:
+            location = active_session.location_constraint
+            distance = calculate_distance(
+                float(latitude), float(longitude),
+                float(location.latitude), float(location.longitude)
+            )
+            
+            # Check if distance is within the allowed radius
+            if distance > float(location.radius):
+                return JsonResponse({
+                    'success': False, 
+                    'message': f'You are not within the allowed location for attendance. Distance: {distance:.2f}m, Allowed: {location.radius}m'
+                })
+        
+        # Create attendance record for the student
+        attendance_record = AttendanceRecord.objects.create(
+            user=student_user,
+            session=active_session,
+            latitude=float(latitude) if latitude else None,
+            longitude=float(longitude) if longitude else None,
+            verification_method='manual'  # Manual verification for faculty
+        )
+        
+        # Send attendance confirmation email to student
+        from .utils import send_attendance_email
+        send_attendance_email(student_user, attendance_record)
+        
+        return JsonResponse({
+            'success': True, 
+            'message': f'Attendance marked successfully for student {student_roll_number}!',
+            'timestamp': attendance_record.timestamp.isoformat()
+        })
+        
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error processing faculty attendance: {str(e)}")
+        print(f"Traceback: {error_details}")
+        return JsonResponse({'success': False, 'message': f'Error processing attendance: {str(e)}'})
+
+@csrf_exempt
+def api_user_info(request):
+    """API endpoint for user information"""
+    # Check if user is authenticated
+    if not request.user.is_authenticated:
+        return JsonResponse({'success': False, 'message': 'Authentication required'})
+    
+    try:
+        return JsonResponse({
+            'success': True,
+            'user': {
+                'roll_number': request.user.roll_number,
+                'email': request.user.email,
+                'first_name': request.user.first_name,
+                'last_name': request.user.last_name,
+                'role': request.user.role.name if request.user.role else None,
+                'face_registered': bool(request.user.face_encoding)
+            }
+        })
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+def calculate_distance(lat1, lon1, lat2, lon2):
+    """
+    Calculate the distance between two points using the haversine formula
+    Returns distance in meters
+    """
+    from math import radians, cos, sin, asin, sqrt
+    
+    # Convert decimal degrees to radians
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    
+    # Haversine formula
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+    c = 2 * asin(sqrt(a))
+    
+    # Radius of earth in meters
+    r = 6371000
+    
+    return c * r
+
+@csrf_exempt
+def api_create_session(request):
+    """API endpoint for admin to create a new attendance session"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has admin or faculty role
+        if not (request.user.role and request.user.role.name.lower() in ['admin', 'faculty']):
+            return JsonResponse({'success': False, 'message': 'Administrator or Faculty privileges required'})
+        
+        data = json.loads(request.body)
+        name = data.get('name')
+        location_id = data.get('location_id')
+        duration_minutes = int(data.get('duration_minutes', 60))  # Default 60 minutes
+        
+        if not all([name, location_id]):
+            return JsonResponse({'success': False, 'message': 'Name and location are required'})
+        
+        try:
+            location = LocationConstraint.objects.get(id=location_id)
+            
+            # Create session with faculty association
+            session = AttendanceSession.objects.create(
+                name=name,
+                location_constraint=location,
+                start_time=timezone.now(),
+                end_time=timezone.now() + timedelta(minutes=duration_minutes),
+                is_active=False,
+                faculty=request.user  # Associate with the creating faculty/admin
+            )
+            
+            return JsonResponse({
+                'success': True, 
+                'message': f'Session "{session.name}" created successfully',
+                'session_id': session.id
+            })
+            
+        except LocationConstraint.DoesNotExist:
+            return JsonResponse({'success': False, 'message': 'Invalid location selected'})
+        except Exception as e:
+            return JsonResponse({'success': False, 'message': f'Error creating session: {str(e)}'})
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_start_session(request):
+    """API endpoint for faculty/admin to start an attendance session"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has admin or faculty role
+        if not (request.user.role and request.user.role.name.lower() in ['admin', 'faculty']):
+            return JsonResponse({'success': False, 'message': 'Administrator or Faculty privileges required'})
+        
+        data = json.loads(request.body)
+        session_id = data.get('session_id')
+        
+        if not session_id:
+            return JsonResponse({'success': False, 'message': 'Session ID is required'})
+        
+        try:
+            # Get the original session to copy its properties
+            original_session = AttendanceSession.objects.get(id=session_id)
+            
+            # Get user role for authorization check
+            user_role = request.user.role.name.lower() if request.user.role else ''
+            
+            # Check if faculty is authorized to start this session
+            if user_role == 'faculty' and original_session.faculty != request.user:
+                return JsonResponse({'success': False, 'message': 'You are not authorized to start this session'})
+            
+            # Delete old sessions with the same name for this faculty
+            # This ensures only the latest session with a given name exists
+            print(f"Deleting old sessions: name={original_session.name}, faculty_id={original_session.faculty.id}")
+            deleted_count = AttendanceSession.objects.filter(
+                name=original_session.name,
+                faculty=original_session.faculty
+            ).delete()
+            print(f"Deleted {deleted_count[0]} old sessions")
+            
+            # Create a new session instance with the same properties including target_year, level, and department
+            new_session = AttendanceSession.objects.create(
+                name=original_session.name,
+                location_constraint=original_session.location_constraint,
+                start_time=timezone.now(),
+                end_time=timezone.now() + (original_session.end_time - original_session.start_time),
+                is_active=True,
+                faculty=original_session.faculty,
+                target_year=original_session.target_year,  # Copy target year from original session
+                level=original_session.level,  # Copy level from original session
+                department=original_session.department  # Copy department from original session
+            )
+            
+            # Debug logging
+            print(f"Faculty API - Created new session: ID={new_session.id}, Name={new_session.name}, Start={new_session.start_time}, End={new_session.end_time}, Target Year={new_session.target_year}, Level={new_session.level}, Department={new_session.department}")
+            
+            return JsonResponse({
+                'success': True, 
+                'message': f'Session "{new_session.name}" started successfully',
+                'session_id': new_session.id
+            })
+            
+        except AttendanceSession.DoesNotExist:
+            return JsonResponse({'success': False, 'message': 'Session not found'})
+        except Exception as e:
+            return JsonResponse({'success': False, 'message': f'Error starting session: {str(e)}'})
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+
+@csrf_exempt
+def api_faculty_start_session(request, session_id):
+    """API endpoint for faculty to start their own session"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has faculty or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['faculty', 'admin']:
+            return JsonResponse({'success': False, 'message': 'Faculty or Administrator privileges required'})
+            
+        
+        try:
+            # Get the original session to copy its properties
+            original_session = AttendanceSession.objects.get(id=session_id)
+            
+            # Check if faculty is authorized to start this session
+            if user_role == 'faculty' and original_session.faculty != request.user:
+                return JsonResponse({'success': False, 'message': 'You are not authorized to start this session'})
+            
+            # Delete old sessions with the same name for this faculty
+            # This ensures only the latest session with a given name exists
+            print(f"Deleting old sessions: name={original_session.name}, faculty_id={original_session.faculty.id}")
+            deleted_count = AttendanceSession.objects.filter(
+                name=original_session.name,
+                faculty=original_session.faculty
+            ).delete()
+            print(f"Deleted {deleted_count[0]} old sessions")
+            
+            # Create a new session instance with the same properties including target_year, level, and department
+            new_session = AttendanceSession.objects.create(
+                name=original_session.name,
+                location_constraint=original_session.location_constraint,
+                start_time=timezone.now(),
+                end_time=timezone.now() + (original_session.end_time - original_session.start_time),
+                is_active=True,
+                faculty=original_session.faculty,
+                target_year=original_session.target_year,  # Copy target year from original session
+                level=original_session.level,  # Copy level from original session
+                department=original_session.department  # Copy department from original session
+            )
+            
+            # Debug logging
+            print(f"Faculty API - Created new session: ID={new_session.id}, Name={new_session.name}, Start={new_session.start_time}, End={new_session.end_time}, Target Year={new_session.target_year}, Level={new_session.level}, Department={new_session.department}")
+            
+            return JsonResponse({
+                'success': True, 
+                'message': f'Session "{new_session.name}" started successfully',
+                'session_id': new_session.id
+            })
+            
+        except AttendanceSession.DoesNotExist:
+            return JsonResponse({'success': False, 'message': 'Session not found'})
+        except Exception as e:
+            return JsonResponse({'success': False, 'message': f'Error starting session: {str(e)}'})
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_mark_attendance_without_face_recognition(request):
+    """API endpoint for faculty to mark attendance manually"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has faculty or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['faculty', 'admin']:
+            return JsonResponse({'success': False, 'message': 'Faculty or Administrator privileges required'})
+        
+        data = json.loads(request.body)
+        student_roll_number = data.get('student_roll_number')
+        session_id = data.get('session_id')
+        latitude = data.get('latitude')
+        longitude = data.get('longitude')
+        
+        if not all([student_roll_number, session_id]):
+            return JsonResponse({'success': False, 'message': 'Student roll number and session ID are required'})
+        
+        try:
+            # Get the student and session
+            student = User.objects.get(roll_number=student_roll_number)
+            session = AttendanceSession.objects.get(id=session_id)
+            
+            # Check if the session is active
+            if not session.is_active:
+                return JsonResponse({'success': False, 'message': 'Session is not active'})
+            
+            # Check if the student's year matches the session's target year
+            if session.target_year and student.year != session.target_year:
+                return JsonResponse({
+                    'success': False, 
+                    'message': f'This session is only for {session.get_target_year_display()} students. '
+                              f'You are a {student.get_year_display()} student.'
+                })
+            
+            # Check if faculty is authorized to mark attendance for this session
+            if user_role == 'faculty' and session.faculty != request.user:
+                return JsonResponse({'success': False, 'message': 'You are not authorized to mark attendance for this session'})
+            
+            # Check if attendance record already exists
+            if AttendanceRecord.objects.filter(user=student, session=session).exists():
+                return JsonResponse({'success': False, 'message': 'Attendance already marked for this student in this session'})
+            
+            # Validate location if provided
+            location_valid = True
+            if latitude is not None and longitude is not None:
+                try:
+                    lat = float(latitude)
+                    lon = float(longitude)
+                    
+                    # Check if the location is within the allowed radius
+                    if session.location_constraint.latitude and session.location_constraint.longitude:
+                        from geopy.distance import geodesic
+                        session_location = (float(session.location_constraint.latitude), float(session.location_constraint.longitude))
+                        student_location = (lat, lon)
+                        distance = geodesic(session_location, student_location).meters
+                        
+                        if distance > float(session.location_constraint.radius):
+                            location_valid = False
+                except (ValueError, TypeError):
+                    location_valid = False
+            
+            if not location_valid:
+                return JsonResponse({'success': False, 'message': 'Location verification failed'})
+            
+            # Create attendance record
+            attendance_record = AttendanceRecord.objects.create(
+                user=student,
+                session=session,
+                latitude=latitude,
+                longitude=longitude,
+                verification_method='manual'
+            )
+            
+            # Send email notification
+            try:
+                send_attendance_email(student, session)
+            except Exception as e:
+                print(f"Failed to send attendance email: {e}")
+                # Don't fail the whole operation if email sending fails
+            
+            return JsonResponse({
+                'success': True, 
+                'message': f'Attendance marked successfully for {student_roll_number}',
+                'attendance_id': attendance_record.id
+            })
+            
+        except User.DoesNotExist:
+            return JsonResponse({'success': False, 'message': 'Student not found'})
+        except AttendanceSession.DoesNotExist:
+            return JsonResponse({'success': False, 'message': 'Session not found'})
+        except Exception as e:
+            return JsonResponse({'success': False, 'message': f'Error marking attendance: {str(e)}'})
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_stop_session(request):
+    """API endpoint for faculty/admin to stop an attendance session"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has admin or faculty role
+        if not (request.user.role and request.user.role.name.lower() in ['admin', 'faculty']):
+            return JsonResponse({'success': False, 'message': 'Administrator or Faculty privileges required'})
+        
+        data = json.loads(request.body)
+        session_id = data.get('session_id')
+        
+        if not session_id:
+            return JsonResponse({'success': False, 'message': 'Session ID is required'})
+        
+        try:
+            session = AttendanceSession.objects.get(id=session_id)
+            
+            # Check if faculty is authorized to stop this session
+            if request.user.role.name.lower() == 'faculty' and session.faculty != request.user:
+                return JsonResponse({'success': False, 'message': 'You are not authorized to stop this session'})
+            
+            session.is_active = False
+            session.end_time = timezone.now()  # Set end time when stopping session
+            session.save()
+            
+            return JsonResponse({
+                'success': True, 
+                'message': f'Session "{session.name}" stopped successfully',
+                'session_id': session.id
+            })
+            
+        except AttendanceSession.DoesNotExist:
+            return JsonResponse({'success': False, 'message': 'Session not found'})
+        except Exception as e:
+            return JsonResponse({'success': False, 'message': f'Error stopping session: {str(e)}'})
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_faculty_stop_session(request, session_id):
+    """API endpoint for faculty to stop their own session"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has faculty or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['faculty', 'admin']:
+            return JsonResponse({'success': False, 'message': 'Faculty or Administrator privileges required'})
+        
+        try:
+            session = AttendanceSession.objects.get(id=session_id)
+            
+            # Check if faculty is authorized to stop this session
+            if user_role == 'faculty' and session.faculty != request.user:
+                return JsonResponse({'success': False, 'message': 'You are not authorized to stop this session'})
+            
+            session.is_active = False
+            session.end_time = timezone.now()  # Set end time when stopping session
+            session.save()
+            
+            return JsonResponse({
+                'success': True, 
+                'message': f'Session "{session.name}" stopped successfully',
+                'session_id': session.id
+            })
+            
+        except AttendanceSession.DoesNotExist:
+            return JsonResponse({'success': False, 'message': 'Session not found'})
+        except Exception as e:
+            return JsonResponse({'success': False, 'message': f'Error stopping session: {str(e)}'})
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_all_users(request):
+    """API endpoint for admin to get all users"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has admin role
+        if not (request.user.role and request.user.role.name.lower() == 'admin'):
+            return JsonResponse({'success': False, 'message': 'Administrator privileges required'})
+        
+        users = User.objects.all()
+        user_data = [{'id': user.id, 'username': user.username, 'email': user.email, 'role': user.role.name if user.role else ''} for user in users]
+        
+        return JsonResponse({'success': True, 'users': user_data})
+        
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_create_location_constraint(request):
+    """API endpoint for admin to create location constraints"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has admin role
+        if not (request.user.role and request.user.role.name.lower() == 'admin'):
+            return JsonResponse({'success': False, 'message': 'Administrator privileges required'})
+        
+        data = json.loads(request.body)
+        name = data.get('name')
+        latitude = data.get('latitude')
+        longitude = data.get('longitude')
+        radius = data.get('radius')
+        
+        if not all([name, latitude, longitude, radius]):
+            return JsonResponse({'success': False, 'message': 'All fields are required'})
+        
+        try:
+            # Convert string values to Decimal
+            from decimal import Decimal
+            latitude_decimal = Decimal(str(latitude))
+            longitude_decimal = Decimal(str(longitude))
+            radius_decimal = Decimal(str(radius))
+            
+            # Validate radius is within allowed range (up to 10000000 meters)
+            if radius_decimal > 10000000:
+                return JsonResponse({'success': False, 'message': 'Radius cannot exceed 10,000,000 meters'})
+            
+            # Warn if radius is too small for reliable GPS accuracy
+            if radius_decimal < 50:
+                return JsonResponse({'success': False, 'message': 'Radius should be at least 50 meters for reliable GPS accuracy'})
+            
+            location = LocationConstraint.objects.create(
+                name=name,
+                latitude=latitude_decimal,
+                longitude=longitude_decimal,
+                radius=radius_decimal,
+                is_active=True
+            )
+            
+            return JsonResponse({
+                'success': True, 
+                'message': f'Location constraint "{location.name}" created successfully',
+                'location_id': location.id
+            })
+            
+        except Exception as e:
+            return JsonResponse({'success': False, 'message': f'Error creating location constraint: {str(e)}'})
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_active_session(request):
+    """API endpoint to get the active session"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Debug: Print user information
+        print(f"User making request to active session: {request.user.roll_number} ({request.user.first_name} {request.user.last_name})")
+        print(f"User role: {request.user.role.name if request.user.role else 'None'}")
+        
+        # Get active session
+        active_session = AttendanceSession.objects.filter(is_active=True).first()
+        
+        # Debug: Print active session information
+        if active_session:
+            print(f"Found active session: {active_session.id} - {active_session.name} - Faculty: {active_session.faculty.roll_number if active_session.faculty else 'None'}")
+        else:
+            print("No active session found")
+        
+        if active_session:
+            return JsonResponse({
+                'success': True,
+                'active_session': {
+                    'id': active_session.id,
+                    'name': active_session.name,
+                    'location': {
+                        'name': active_session.location_constraint.name,
+                        'latitude': str(active_session.location_constraint.latitude),
+                        'longitude': str(active_session.location_constraint.longitude),
+                        'radius': str(active_session.location_constraint.radius)
+                    },
+                    'start_time': active_session.start_time.strftime("%Y-%m-%d %H:%M:%S"),
+                    'end_time': active_session.end_time.strftime("%Y-%m-%d %H:%M:%S") if active_session.end_time else None,
+                    'faculty': {
+                        'id': active_session.faculty.id,
+                        'roll_number': active_session.faculty.roll_number,
+                        'first_name': active_session.faculty.first_name,
+                        'last_name': active_session.faculty.last_name,
+                        'email': active_session.faculty.email
+                    }
+                }
+            })
+        else:
+            return JsonResponse({'success': False, 'message': 'No active session found'})
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_stop_session(request):
+    """API endpoint to stop an active session"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Debug: Print user information
+        print(f"User making request to stop session: {request.user.roll_number} ({request.user.first_name} {request.user.last_name})")
+        print(f"User role: {request.user.role.name if request.user.role else 'None'}")
+        
+        # Check if user has faculty or admin role (both can stop sessions)
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['faculty', 'admin']:
+            return JsonResponse({'success': False, 'message': 'Faculty or administrator privileges required'})
+        
+        # Get the active session for this faculty member
+        active_session = AttendanceSession.objects.filter(
+            faculty=request.user,
+            is_active=True
+        ).first()
+        
+        if not active_session:
+            return JsonResponse({'success': False, 'message': 'No active session found for this faculty member'})
+        
+        # Stop the session
+        active_session.is_active = False
+        active_session.end_time = timezone.now()  # Set end time when stopping session
+        active_session.save()
+        
+        return JsonResponse({
+            'success': True, 
+            'message': f'Session "{active_session.name}" stopped successfully!'
+        })
+        
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error stopping session: {str(e)}'})
+
+@csrf_exempt
+def api_send_hod_attendance_report(request):
+    """API endpoint for HOD to send attendance report emails for a specific date"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has HOD role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role != 'hod':
+            return JsonResponse({'success': False, 'message': 'HOD privileges required'})
+        
+        data = json.loads(request.body)
+        selected_date = data.get('date')  # Format: YYYY-MM-DD
+        selected_time = data.get('time')  # Format: HH:MM
+        
+        if not all([selected_date, selected_time]):
+            return JsonResponse({'success': False, 'message': 'Date and time are required'})
+        
+        # Parse the date and time
+        from datetime import datetime
+        selected_datetime = datetime.strptime(f"{selected_date} {selected_time}", "%Y-%m-%d %H:%M")
+        
+        # Get HOD's department
+        hod_department = request.user.department
+        if not hod_department:
+            return JsonResponse({'success': False, 'message': 'HOD department not found'})
+        
+        # Get all users in the HOD's department
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        department_users = User.objects.filter(department=hod_department, is_active=True)
+        
+        # Get all sessions that started on the selected date
+        from .models import AttendanceSession, AttendanceRecord
+        sessions = AttendanceSession.objects.filter(
+            start_time__date=selected_datetime.date(),
+            department=hod_department
+        )
+        
+        if not sessions.exists():
+            return JsonResponse({'success': False, 'message': 'No sessions found for the selected date'})
+        
+        # Send attendance report emails to all users in the department
+        from .utils import send_attendance_report_email
+        success_count = 0
+        error_count = 0
+        total_users = department_users.count()
+        
+        # Process each user once and collect all their session data
+        for user in department_users:
+            try:
+                # Prepare attendance data for this user
+                # Group sessions by name and keep only the latest one to avoid duplicates
+                session_groups = {}
+                for session in sessions:
+                    session_name = session.name
+                    # If this is the first session with this name, or if this session is newer
+                    if session_name not in session_groups or session.start_time > session_groups[session_name].start_time:
+                        session_groups[session_name] = session
+                
+                # Prepare consolidated attendance data with deduplicated sessions
+                user_attendance_data = []
+                for session_name, session in session_groups.items():
+                    # Check if user has attendance record for this session
+                    attendance_record = AttendanceRecord.objects.filter(
+                        user=user,
+                        session=session
+                    ).first()
+                    
+                    user_attendance_data.append({
+                        'session_name': session.name,
+                        'session_time': session.start_time.strftime("%Y-%m-%d %H:%M"),
+                        'attended': attendance_record is not None,
+                        # Convert timestamp to local timezone (Asia/Kolkata)
+                        'timestamp': attendance_record.timestamp.astimezone(pytz.timezone('Asia/Kolkata')).strftime("%Y-%m-%d %H:%M:%S") if attendance_record else None
+                    })
+                
+                # Send ONE email per user with all their session information
+                email_sent = send_attendance_report_email(user, selected_datetime.date(), user_attendance_data)
+                if email_sent:
+                    success_count += 1
+                else:
+                    error_count += 1
+                    
+            except Exception as e:
+                print(f"Error sending email to user {user.email}: {e}")
+                error_count += 1
+        
+        return JsonResponse({
+            'success': True,
+            'message': f'Attendance reports sent successfully. {success_count} emails sent, {error_count} failed.',
+            'emails_sent': success_count,
+            'emails_failed': error_count,
+            'total_users': total_users
+        })
+        
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_stop_active_session(request):
+    """API endpoint to stop the active session"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Debug: Print user information
+        print(f"User making request to stop session: {request.user.roll_number} ({request.user.first_name} {request.user.last_name})")
+        print(f"User role: {request.user.role.name if request.user.role else 'None'}")
+        
+        # Get active session
+        active_session = AttendanceSession.objects.filter(is_active=True).first()
+        
+        # Debug: Print active session information
+        if active_session:
+            print(f"Found active session: {active_session.id} - {active_session.name} - Faculty: {active_session.faculty.roll_number if active_session.faculty else 'None'}")
+        else:
+            print("No active session found")
+        
+        if active_session:
+            active_session.is_active = False
+            active_session.save()
+            return JsonResponse({
+                'success': True,
+                'message': f'Session "{active_session.name}" stopped successfully',
+                'session_id': active_session.id
+            })
+        else:
+            return JsonResponse({
+                'success': False,
+                'message': 'No active session found to stop'
+            })
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+        
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error stopping session: {str(e)}'})
+
+@csrf_exempt
+def api_get_user_attendance(request):
+    """API endpoint to get user's attendance records"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Debug: Print user information
+        print(f"User making request: {request.user.roll_number} ({request.user.first_name} {request.user.last_name})")
+        
+        # Get optional date range parameters
+        start_date = request.GET.get('start_date')
+        end_date = request.GET.get('end_date')
+        
+        # Get attendance records for the user
+        records_query = AttendanceRecord.objects.filter(user=request.user).order_by('-timestamp')
+        
+        # Debug: Print number of records found
+        print(f"Found {records_query.count()} attendance records for user {request.user.roll_number}")
+        
+        # Filter by date range if provided
+        if start_date:
+            records_query = records_query.filter(timestamp__date__gte=start_date)
+        if end_date:
+            records_query = records_query.filter(timestamp__date__lte=end_date)
+        
+        records = records_query
+        
+        records_data = []
+        for record in records:
+            records_data.append({
+                'id': record.id,
+                'session_name': record.session.name,
+                'timestamp': record.timestamp.isoformat(),
+                'verification_method': record.verification_method,
+                'latitude': str(record.latitude) if record.latitude else None,
+                'longitude': str(record.longitude) if record.longitude else None
+            })
+        
+        # Debug: Print records data
+        print(f"Returning records data: {records_data}")
+        
+        return JsonResponse({
+            'success': True,
+            'records': records_data
+        })
+        
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error in api_get_user_attendance: {str(e)}")
+        print(f"Traceback: {error_details}")
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_admin_dashboard_stats(request):
+    """API endpoint to get admin dashboard statistics"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has admin role
+        if not (request.user.role and request.user.role.name.lower() == 'admin'):
+            return JsonResponse({'success': False, 'message': 'Administrator privileges required'})
+        
+        # Get statistics
+        total_users = User.objects.count()
+        total_sessions = AttendanceSession.objects.count()
+        active_sessions = AttendanceSession.objects.filter(is_active=True).count()
+        total_attendance_records = AttendanceRecord.objects.count()
+        
+        # Get recent attendance records (last 10)
+        recent_records = AttendanceRecord.objects.select_related('user', 'session').order_by('-timestamp')[:10]
+        
+        recent_records_data = []
+        for record in recent_records:
+            recent_records_data.append({
+                'user_roll_number': record.user.roll_number,
+                'session_name': record.session.name,
+                'timestamp': record.timestamp.isoformat(),
+                'verification_method': record.verification_method
+            })
+        
+        return JsonResponse({
+            'success': True,
+            'stats': {
+                'total_users': total_users,
+                'total_sessions': total_sessions,
+                'active_sessions': active_sessions,
+                'total_attendance_records': total_attendance_records,
+                'recent_records': recent_records_data
+            }
+        })
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_all_attendance_records(request):
+    """API endpoint to get all attendance records for admin dashboard"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has admin role
+        if not (request.user.role and request.user.role.name.lower() == 'admin'):
+            return JsonResponse({'success': False, 'message': 'Administrator privileges required'})
+        
+        # Get all attendance records ordered by timestamp
+        records = AttendanceRecord.objects.select_related('user', 'session').order_by('-timestamp')
+        
+        records_data = []
+        for record in records:
+            records_data.append({
+                'id': record.id,
+                'user_roll_number': record.user.roll_number,
+                'user_name': f"{record.user.first_name} {record.user.last_name}".strip(),
+                'session_name': record.session.name,
+                'timestamp': record.timestamp.isoformat(),
+                'verification_method': record.verification_method,
+                'latitude': str(record.latitude) if record.latitude else None,
+                'longitude': str(record.longitude) if record.longitude else None
+            })
+        
+        return JsonResponse({
+            'success': True,
+            'records': records_data
+        })
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_location_constraints(request):
+    """API endpoint to get all location constraints"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has admin role
+        if not (request.user.role and request.user.role.name.lower() == 'admin'):
+            return JsonResponse({'success': False, 'message': 'Administrator privileges required'})
+        
+        # Get ALL location constraints (not just active ones)
+        # This allows admins to see and delete old/past location constraints
+        locations = LocationConstraint.objects.all()
+        
+        locations_data = []
+        for location in locations:
+            locations_data.append({
+                'id': location.id,
+                'name': location.name,
+                'latitude': str(location.latitude),
+                'longitude': str(location.longitude),
+                'radius': str(location.radius),
+                'is_active': location.is_active  # Include is_active status
+            })
+        
+        return JsonResponse({
+            'success': True,
+            'locations': locations_data
+        })
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_user_profile(request):
+    """API endpoint to get user profile information"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Return user profile information
+        user_data = {
+            'id': request.user.id,
+            'roll_number': request.user.roll_number,
+            'email': request.user.email,
+            'first_name': request.user.first_name,
+            'last_name': request.user.last_name,
+            'role': request.user.role.name if request.user.role else None,
+            'face_registered': bool(request.user.face_encoding),
+            'face_image': request.user.face_image,  # Include face image data
+            'is_active': request.user.is_active,
+            'date_joined': request.user.date_joined.isoformat(),
+            'year': request.user.year,  # Add year
+            'department': request.user.department,  # Add department
+            'level': request.user.level,  # Add level
+        }
+        
+        return JsonResponse({
+            'success': True,
+            'user': user_data
+        })
+        
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_user_monthly_reports(request):
+    """API endpoint to get user's monthly reports"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Get all monthly reports for the user
+        from .models import MonthlyReport
+        reports = MonthlyReport.objects.filter(user=request.user).order_by('-month')
+        
+        reports_data = []
+        for report in reports:
+            reports_data.append({
+                'id': report.id,
+                'month': report.month.strftime('%Y-%m'),
+                'month_display': report.month.strftime('%B %Y'),
+                'total_sessions': report.total_sessions,
+                'attended_sessions': report.attended_sessions,
+                'attendance_percentage': float(report.attendance_percentage)
+            })
+        
+        return JsonResponse({
+            'success': True,
+            'reports': reports_data
+        })
+        
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_faculty_create_location_constraint(request):
+    """API endpoint for faculty to create location constraints"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has faculty or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['faculty', 'admin']:
+            return JsonResponse({'success': False, 'message': 'Faculty or Administrator privileges required'})
+        
+        data = json.loads(request.body)
+        name = data.get('name')
+        latitude = data.get('latitude')
+        longitude = data.get('longitude')
+        radius = data.get('radius')
+        
+        if not all([name, latitude, longitude, radius]):
+            return JsonResponse({'success': False, 'message': 'All fields are required'})
+        
+        try:
+            # Convert string values to Decimal
+            from decimal import Decimal
+            latitude_decimal = Decimal(str(latitude))
+            longitude_decimal = Decimal(str(longitude))
+            radius_decimal = Decimal(str(radius))
+            
+            # Validate radius is within allowed range (up to 10000000 meters)
+            if radius_decimal > 10000000:
+                return JsonResponse({'success': False, 'message': 'Radius cannot exceed 10,000,000 meters'})
+            
+            location = LocationConstraint.objects.create(
+                name=name,
+                latitude=latitude_decimal,
+                longitude=longitude_decimal,
+                radius=radius_decimal,
+                is_active=True
+            )
+            
+            return JsonResponse({
+                'success': True, 
+                'message': f'Location constraint "{location.name}" created successfully',
+                'location_id': location.id
+            })
+            
+        except Exception as e:
+            return JsonResponse({'success': False, 'message': f'Error creating location constraint: {str(e)}'})
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_faculty_get_location_constraints(request):
+    """API endpoint for faculty to get location constraints"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has faculty or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['faculty', 'admin']:
+            return JsonResponse({'success': False, 'message': 'Faculty or Administrator privileges required'})
+        
+        # Get ALL location constraints (not just active ones)
+        locations = LocationConstraint.objects.all()
+        
+        locations_data = []
+        for location in locations:
+            locations_data.append({
+                'id': location.id,
+                'name': location.name,
+                'latitude': str(location.latitude),
+                'longitude': str(location.longitude),
+                'radius': str(location.radius),
+                'is_active': location.is_active
+            })
+        
+        return JsonResponse({
+            'success': True,
+            'locations': locations_data
+        })
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_faculty_sessions(request):
+    """API endpoint for faculty to get their own sessions"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Debug: Print user information
+        print(f"User making request: {request.user.roll_number} ({request.user.first_name} {request.user.last_name})")
+        print(f"User role: {request.user.role.name if request.user.role else 'None'}")
+        
+        # Check if user has faculty or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['faculty', 'admin']:
+            return JsonResponse({'success': False, 'message': 'Faculty or Administrator privileges required'})
+        
+        # Get sessions for this faculty member
+        sessions = AttendanceSession.objects.filter(faculty=request.user).order_by('-start_time')
+        
+        # Debug: Print number of sessions found
+        print(f"Found {sessions.count()} sessions for user {request.user.roll_number}")
+        
+        sessions_data = []
+        for session in sessions:
+            # Debug: Print session information
+            print(f"Session {session.id}: {session.name} - Faculty: {session.faculty.roll_number if session.faculty else 'None'}")
+            
+            sessions_data.append({
+                'id': session.id,
+                'name': session.name,
+                'location_constraint': {
+                    'id': session.location_constraint.id,
+                    'name': session.location_constraint.name,
+                    'latitude': str(session.location_constraint.latitude),
+                    'longitude': str(session.location_constraint.longitude),
+                    'radius': str(session.location_constraint.radius)
+                },
+                'start_time': timezone.now(),
+                'end_time': timezone.now() + (session.end_time - session.start_time),
+                'is_active': session.is_active,
+                'duration_minutes': int((session.end_time - session.start_time).total_seconds() / 60) if session.start_time and session.end_time else 60
+            })
+        
+        # Return data in the format expected by the frontend
+        return JsonResponse({
+            'success': True,
+            'data': {
+                'sessions': sessions_data
+            }
+        })
+            
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error in api_get_faculty_sessions: {str(e)}")
+        print(f"Traceback: {error_details}")
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_faculty_sessions(request):
+    """API endpoint for faculty to create sessions"""
+    if request.method == 'POST':
+        try:
+            # Check if user is authenticated
+            if not request.user.is_authenticated:
+                return JsonResponse({'success': False, 'message': 'Authentication required'})
+            
+            # Check if user has faculty or admin role
+            user_role = request.user.role.name.lower() if request.user.role else ''
+            if user_role not in ['faculty', 'admin']:
+                return JsonResponse({'success': False, 'message': 'Faculty or Administrator privileges required'})
+            
+            data = json.loads(request.body)
+            name = data.get('name')
+            location_id = data.get('location_id')
+            duration_minutes = int(data.get('duration_minutes', 60))  # Default 60 minutes
+            target_year = data.get('target_year')  # Get target year from request
+            
+            if not all([name, location_id]):
+                return JsonResponse({'success': False, 'message': 'Name and location are required'})
+            
+            # Convert location_id to integer if it's a string
+            try:
+                if isinstance(location_id, str):
+                    location_id = int(location_id)
+            except (ValueError, TypeError):
+                return JsonResponse({'success': False, 'message': 'Invalid location ID'})
+            
+            try:
+                location = LocationConstraint.objects.get(id=location_id)
+                
+                # Create session with faculty association and target year
+                session = AttendanceSession.objects.create(
+                    name=name,
+                    location_constraint=location,
+                    start_time=timezone.now(),
+                    end_time=timezone.now() + timedelta(minutes=duration_minutes),
+                    is_active=False,
+                    faculty=request.user,  # Associate with the creating faculty
+                    target_year=target_year,
+                    level=data.get('level'),
+                    department=data.get('department')
+                )
+                
+                return JsonResponse({
+                    'success': True, 
+                    'message': f'Session "{session.name}" created successfully',
+                    'session_id': session.id
+                })
+                
+            except LocationConstraint.DoesNotExist:
+                return JsonResponse({'success': False, 'message': 'Invalid location selected'})
+            except Exception as e:
+                return JsonResponse({'success': False, 'message': f'Error creating session: {str(e)}'})
+                
+        except Exception as e:
+            return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+    else:
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+
+@csrf_exempt
+def api_start_session(request):
+    """API endpoint for faculty/admin to start an attendance session"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        # Check if user has admin or faculty role
+        if not (request.user.role and request.user.role.name.lower() in ['admin', 'faculty']):
+            return JsonResponse({'success': False, 'message': 'Administrator or Faculty privileges required'})
+        
+        data = json.loads(request.body)
+        session_id = data.get('session_id')
+        
+        if not session_id:
+            return JsonResponse({'success': False, 'message': 'Session ID is required'})
+        
+        try:
+            # Get the original session to copy its properties
+            original_session = AttendanceSession.objects.get(id=session_id)
+            
+            # Get user role for authorization check
+            user_role = request.user.role.name.lower() if request.user.role else ''
+            
+            try:
+                # Get the original session to copy its properties
+                original_session = AttendanceSession.objects.get(id=session_id)
+                
+                # Check if faculty is authorized to start this session
+                if user_role == 'faculty' and original_session.faculty != request.user:
+                    return JsonResponse({'success': False, 'message': 'You are not authorized to start this session'})
+                
+                # Always create a new session to preserve separate attendance records
+                # Calculate duration from original session
+                original_duration = original_session.end_time - original_session.start_time
+                now = timezone.now()
+                new_session = AttendanceSession.objects.create(
+                    name=original_session.name,
+                    location_constraint=original_session.location_constraint,
+                    start_time=now,
+                    end_time=now + original_duration,
+                    is_active=True,
+                    faculty=original_session.faculty,
+                    target_year=original_session.target_year,  # Copy target year from original session
+                    level=original_session.level,  # Copy level from original session
+                    department=original_session.department  # Copy department from original session
+                )
+                
+                return JsonResponse({
+                    'success': True, 
+                    'message': f'Session "{new_session.name}" started successfully',
+                    'session_id': new_session.id
+                })
+            except AttendanceSession.DoesNotExist:
+                return JsonResponse({'success': False, 'message': 'Session not found'})
+            except Exception as e:
+                return JsonResponse({'success': False, 'message': f'Error starting session: {str(e)}'})
+            
+        except Exception as e:
+            return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_stop_session(request):
+    """API endpoint for faculty/admin to stop an attendance session"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has admin or faculty role
+        if not (request.user.role and request.user.role.name.lower() in ['admin', 'faculty']):
+            return JsonResponse({'success': False, 'message': 'Administrator or Faculty privileges required'})
+        
+        data = json.loads(request.body)
+        session_id = data.get('session_id')
+        
+        if not session_id:
+            return JsonResponse({'success': False, 'message': 'Session ID is required'})
+        
+        try:
+            session = AttendanceSession.objects.get(id=session_id)
+            
+            # Check if faculty is authorized to stop this session
+            if request.user.role.name.lower() == 'faculty' and session.faculty != request.user:
+                return JsonResponse({'success': False, 'message': 'You are not authorized to stop this session'})
+            
+            session.is_active = False
+            session.end_time = timezone.now()  # Set end time when stopping session
+            session.save()
+            
+            return JsonResponse({
+                'success': True, 
+                'message': f'Session "{session.name}" stopped successfully',
+                'session_id': session.id
+            })
+            
+        except AttendanceSession.DoesNotExist:
+            return JsonResponse({'success': False, 'message': 'Session not found'})
+        except Exception as e:
+            return JsonResponse({'success': False, 'message': f'Error stopping session: {str(e)}'})
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_faculty_start_session(request, session_id):
+    """API endpoint for faculty to start their own session"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has faculty or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['faculty', 'admin']:
+            return JsonResponse({'success': False, 'message': 'Faculty or Administrator privileges required'})
+        
+        # Get the original session to copy its properties
+        original_session = AttendanceSession.objects.get(id=session_id)
+        
+        # Check if faculty is authorized to start this session
+        if user_role == 'faculty' and original_session.faculty != request.user:
+            return JsonResponse({'success': False, 'message': 'You are not authorized to start this session'})
+        
+        # Always create a new session to preserve separate attendance records
+        # Calculate duration from original session
+        original_duration = original_session.end_time - original_session.start_time
+        now = timezone.now()
+        new_session = AttendanceSession.objects.create(
+            name=original_session.name,
+            location_constraint=original_session.location_constraint,
+            start_time=now,
+            end_time=now + original_duration,
+            is_active=True,
+            faculty=original_session.faculty,
+            target_year=original_session.target_year,  # Copy target year from original session
+            level=original_session.level,  # Copy level from original session
+            department=original_session.department  # Copy department from original session
+        )
+        
+        # Debug logging
+        print(f"Faculty API - Created new session: ID={new_session.id}, Name={new_session.name}, Start={new_session.start_time}, End={new_session.end_time}, Target Year={new_session.target_year}, Level={new_session.level}, Department={new_session.department}")
+        
+        return JsonResponse({
+            'success': True, 
+            'message': f'Session "{new_session.name}" started successfully',
+            'session_id': new_session.id
+        })
+        
+    except AttendanceSession.DoesNotExist:
+        return JsonResponse({'success': False, 'message': 'Session not found'})
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error starting session: {str(e)}'})
+
+@csrf_exempt
+def api_faculty_stop_session(request, session_id):
+    """API endpoint for faculty/admin to stop an attendance session"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has admin or faculty role
+        if not (request.user.role and request.user.role.name.lower() in ['admin', 'faculty']):
+            return JsonResponse({'success': False, 'message': 'Administrator or Faculty privileges required'})
+        
+        try:
+            session = AttendanceSession.objects.get(id=session_id)
+            
+            # Check if faculty is authorized to stop this session
+            if request.user.role.name.lower() == 'faculty' and session.faculty != request.user:
+                return JsonResponse({'success': False, 'message': 'You are not authorized to stop this session'})
+            
+            session.is_active = False
+            session.end_time = timezone.now()  # Set end time when stopping session
+            session.save()
+            
+            return JsonResponse({
+                'success': True, 
+                'message': f'Session "{session.name}" stopped successfully',
+                'session_id': session.id
+            })
+            
+        except AttendanceSession.DoesNotExist:
+            return JsonResponse({'success': False, 'message': 'Session not found'})
+        except Exception as e:
+            return JsonResponse({'success': False, 'message': f'Error stopping session: {str(e)}'})
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_change_password(request):
+    """API endpoint for users to change their password"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        data = json.loads(request.body)
+        current_password = data.get('current_password')
+        new_password = data.get('new_password')
+        confirm_password = data.get('confirm_password')
+        
+        # Validate input
+        if not all([current_password, new_password, confirm_password]):
+            return JsonResponse({'success': False, 'message': 'All fields are required'})
+        
+        if new_password != confirm_password:
+            return JsonResponse({'success': False, 'message': 'New password and confirm password do not match'})
+        
+        if len(new_password) < 6:
+            return JsonResponse({'success': False, 'message': 'Password must be at least 6 characters long'})
+        
+        # Check if current password is correct
+        if not request.user.check_password(current_password):
+            return JsonResponse({'success': False, 'message': 'Current password is incorrect'})
+        
+        # Store the user ID before changing password
+        user_id = request.user.id
+        
+        # Change password
+        request.user.set_password(new_password)
+        request.user.save()
+        
+        # Maintain the session by updating it with the new password hash
+        from django.contrib.auth import login, update_session_auth_hash
+        # Use update_session_auth_hash to maintain the session after password change
+        update_session_auth_hash(request, request.user)
+        
+        return JsonResponse({
+            'success': True, 
+            'message': 'Password changed successfully'
+        })
+        
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_faculty_delete_session(request, session_id):
+    """API endpoint for faculty to delete their own session"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has faculty or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['faculty', 'admin']:
+            return JsonResponse({'success': False, 'message': 'Faculty or Administrator privileges required'})
+        
+        try:
+            session = AttendanceSession.objects.get(id=session_id)
+            
+            # Check if faculty is authorized to delete this session
+            if user_role == 'faculty' and session.faculty != request.user:
+                return JsonResponse({'success': False, 'message': 'You are not authorized to delete this session'})
+            
+            session_name = session.name
+            session.delete()
+            
+            return JsonResponse({
+                'success': True, 
+                'message': f'Session "{session_name}" deleted successfully'
+            })
+            
+        except AttendanceSession.DoesNotExist:
+            return JsonResponse({'success': False, 'message': 'Session not found'})
+        except Exception as e:
+            return JsonResponse({'success': False, 'message': f'Error deleting session: {str(e)}'})
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_faculty_manage_session(request, session_id=None):
+    """API endpoint for faculty to manage their sessions"""
+    if request.method == 'POST':
+        # Start or stop session based on action parameter
+        try:
+            data = json.loads(request.body)
+            action = data.get('action')
+            
+            if action == 'start':
+                return api_faculty_start_session(request, session_id)
+            elif action == 'stop':
+                return api_faculty_stop_session(request, session_id)
+            elif action == 'delete':
+                return api_faculty_delete_session(request, session_id)
+            else:
+                return JsonResponse({'success': False, 'message': 'Invalid action. Use start, stop, or delete.'})
+        except json.JSONDecodeError:
+            return JsonResponse({'success': False, 'message': 'Invalid JSON data'})
+    else:
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+
+@csrf_exempt
+def api_get_faculty_sessions(request):
+    """API endpoint for faculty to get their own sessions"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has faculty, admin, or HOD role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['faculty', 'admin', 'hod']:
+            return JsonResponse({'success': False, 'message': 'Faculty, Administrator, or HOD privileges required'})
+        
+        # For HOD, get all faculty sessions in their department
+        # For faculty/admin, get their own sessions
+        if user_role == 'hod':
+            # HOD can view all faculty sessions in their department
+            sessions = AttendanceSession.objects.filter(
+                faculty__role__name='faculty'
+            ).order_by('-start_time')
+        else:
+            # Faculty and admin get their own sessions
+            sessions = AttendanceSession.objects.filter(faculty=request.user).order_by('-start_time')
+        
+        # Apply filters if provided
+        level = request.GET.get('level')
+        year = request.GET.get('year')
+        
+        if level:
+            sessions = sessions.filter(level=level)
+        if year:
+            sessions = sessions.filter(target_year=year)
+        
+        sessions_data = []
+        for session in sessions:
+            sessions_data.append({
+                'id': session.id,
+                'name': session.name,
+                'location_constraint': {
+                    'id': session.location_constraint.id,
+                    'name': session.location_constraint.name,
+                    'latitude': str(session.location_constraint.latitude),
+                    'longitude': str(session.location_constraint.longitude),
+                    'radius': str(session.location_constraint.radius)
+                },
+                'start_time': session.start_time.astimezone(pytz.timezone('Asia/Kolkata')).isoformat() if session.start_time else None,
+                'end_time': session.end_time.astimezone(pytz.timezone('Asia/Kolkata')).isoformat() if session.end_time else None,
+                'is_active': session.is_active,
+                'duration_minutes': int((session.end_time - session.start_time).total_seconds() / 60) if session.start_time and session.end_time else 60,
+                'target_year': session.target_year,  # Include target year
+                'level': session.level,  # Include level
+                'department': session.department  # Include department
+            })
+        
+        # Return data in the format expected by the frontend
+        return JsonResponse({
+            'success': True,
+            'data': {
+                'sessions': sessions_data
+            }
+        })
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_faculty_sessions_with_attendance(request):
+    """API endpoint for faculty to get their sessions with student attendance data organized by year"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has faculty or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['faculty', 'admin']:
+            return JsonResponse({'success': False, 'message': 'Faculty or Administrator privileges required'})
+        
+        # Get sessions for this faculty member
+        sessions = AttendanceSession.objects.filter(faculty=request.user).order_by('-start_time')
+        
+        # Get all students
+        students = User.objects.filter(role__name='student')
+        
+        # Apply faculty-level restrictions
+        if user_role == 'faculty' and request.user.level == 'UG' and request.user.department:
+            # For UG faculty, restrict students to their assigned department
+            students = students.filter(department=request.user.department, level='UG')
+        
+        # Get year filter from query parameters
+        target_year_filter = request.GET.get('target_year')
+        print(f"Target year filter: {target_year_filter}")
+        if target_year_filter:
+            students = students.filter(year=target_year_filter)
+            print(f"Students after year filter: {students.count()}")
+        else:
+            print(f"No year filter applied, total students: {students.count()}")
+        
+        # If no year filter is applied, we still want to show all students but organized by year
+        # So we don't need to do anything special here - the grouping logic will handle it
+        
+        # Organize data by year and level
+        organized_data = {}
+        
+        # Process sessions and organize by year/level
+        for session in sessions:
+            # Create key based on level and target year
+            key = f"{session.level}_{session.target_year}" if session.level and session.target_year else "other"
+            
+            # Initialize group if not exists
+            if key not in organized_data:
+                organized_data[key] = {
+                    'level': session.level,
+                    'target_year': session.target_year,
+                    'display_name': f"{session.level} - {session.target_year} Year" if session.level and session.target_year else "Other Sessions",
+                    'sessions': []
+                }
+            
+            # Get attendance records for this session
+            attendance_records = AttendanceRecord.objects.filter(session=session)
+            
+            # Create a set of student IDs who attended this session
+            attended_student_ids = set(record.user.id for record in attendance_records)
+            
+            # Build attendance status for each student (only for students in this session's department and level)
+            student_attendance = []
+            # When no year filter is applied, we still want to filter students by the session's year
+            # When a year filter is applied, we've already filtered the students queryset
+            if target_year_filter:
+                # Students are already filtered by year, so we just need to filter by session's level and department
+                session_students = students.filter(level=session.level, department=session.department)
+            else:
+                # No year filter, so we need to filter by session's year, level, and department
+                session_students = students.filter(year=session.target_year, level=session.level, department=session.department)
+            
+            for student in session_students:
+                is_present = student.id in attended_student_ids
+                student_attendance.append({
+                    'student_id': student.id,
+                    'student_roll_number': student.roll_number,
+                    'student_name': f"{student.first_name} {student.last_name}".strip(),
+                    'is_present': is_present
+                })
+            
+            organized_data[key]['sessions'].append({
+                'id': session.id,
+                'name': session.name,
+                'start_time': session.start_time.astimezone(pytz.timezone('Asia/Kolkata')).isoformat() if session.start_time else None,
+                'end_time': session.end_time.astimezone(pytz.timezone('Asia/Kolkata')).isoformat() if session.end_time else None,
+                'is_active': session.is_active,
+                'level': session.level,
+                'department': session.department,
+                'target_year': session.target_year,
+                'student_attendance': student_attendance,
+                'total_students': len(student_attendance),
+                'attended_students': len([s for s in student_attendance if s['is_present']])
+            })
+            
+            # Debug: Print student count for this session
+            print(f"Session {session.name}: {len(student_attendance)} students")
+        
+        # Convert organized data to list format
+        result_groups = list(organized_data.values())
+        
+        # Sort groups by level and year
+        result_groups.sort(key=lambda x: (x['level'] or '', x['target_year'] or ''))
+        
+        return JsonResponse({
+            'success': True,
+            'groups': result_groups
+        })
+            
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error in api_get_faculty_sessions_with_attendance: {str(e)}")
+        print(f"Traceback: {error_details}")
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_faculty_sessions(request):
+    """API endpoint for faculty to create sessions"""
+    if request.method == 'POST':
+        try:
+            # Check if user is authenticated
+            if not request.user.is_authenticated:
+                return JsonResponse({'success': False, 'message': 'Authentication required'})
+            
+            # Check if user has faculty or admin role
+            user_role = request.user.role.name.lower() if request.user.role else ''
+            if user_role not in ['faculty', 'admin']:
+                return JsonResponse({'success': False, 'message': 'Faculty or Administrator privileges required'})
+            
+            data = json.loads(request.body)
+            name = data.get('name')
+            location_id = data.get('location_id')
+            duration_minutes = int(data.get('duration_minutes', 60))  # Default 60 minutes
+            target_year = data.get('target_year')  # Get target year from request
+            level = data.get('level')  # Get level from request
+            department = data.get('department')  # Get department from request
+            
+            if not all([name, location_id]):
+                return JsonResponse({'success': False, 'message': 'Name and location are required'})
+            
+            # Convert location_id to integer if it's a string
+            try:
+                if isinstance(location_id, str):
+                    location_id = int(location_id)
+            except (ValueError, TypeError):
+                return JsonResponse({'success': False, 'message': 'Invalid location ID'})
+            
+            try:
+                location = LocationConstraint.objects.get(id=location_id)
+                
+                # Create session with faculty association, target year, level, and department
+                session = AttendanceSession.objects.create(
+                    name=name,
+                    location_constraint=location,
+                    start_time=timezone.now(),
+                    end_time=timezone.now() + timedelta(minutes=duration_minutes),
+                    is_active=False,
+                    faculty=request.user,  # Associate with the creating faculty
+                    target_year=target_year,  # Save target year
+                    level=level,  # Save level
+                    department=department  # Save department
+                )
+                
+                return JsonResponse({
+                    'success': True, 
+                    'message': f'Session "{session.name}" created successfully',
+                    'session_id': session.id
+                })
+                
+            except LocationConstraint.DoesNotExist:
+                return JsonResponse({'success': False, 'message': 'Invalid location selected'})
+            except Exception as e:
+                return JsonResponse({'success': False, 'message': f'Error creating session: {str(e)}'})
+                
+        except Exception as e:
+            return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+    else:
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+
+@csrf_exempt
+def api_faculty_start_session(request, session_id):
+    """API endpoint for faculty to start their own session"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has faculty or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['faculty', 'admin']:
+            return JsonResponse({'success': False, 'message': 'Faculty or Administrator privileges required'})
+        
+        # Get the original session to copy its properties
+        original_session = AttendanceSession.objects.get(id=session_id)
+        
+        # Check if faculty is authorized to start this session
+        if user_role == 'faculty' and original_session.faculty != request.user:
+            return JsonResponse({'success': False, 'message': 'You are not authorized to start this session'})
+        
+        # Always create a new session to preserve separate attendance records
+        # Calculate duration from original session
+        original_duration = original_session.end_time - original_session.start_time
+        now = timezone.now()
+        new_session = AttendanceSession.objects.create(
+            name=original_session.name,
+            location_constraint=original_session.location_constraint,
+            start_time=now,
+            end_time=now + original_duration,
+            is_active=True,
+            faculty=original_session.faculty,
+            target_year=original_session.target_year,  # Copy target year from original session
+            level=original_session.level,  # Copy level from original session
+            department=original_session.department  # Copy department from original session
+        )
+        
+        # Debug logging
+        print(f"Faculty API - Created new session: ID={new_session.id}, Name={new_session.name}, Start={new_session.start_time}, End={new_session.end_time}, Target Year={new_session.target_year}, Level={new_session.level}, Department={new_session.department}")
+        
+        return JsonResponse({
+            'success': True, 
+            'message': f'Session "{new_session.name}" started successfully',
+            'session_id': new_session.id
+        })
+        
+    except AttendanceSession.DoesNotExist:
+        return JsonResponse({'success': False, 'message': 'Session not found'})
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error starting session: {str(e)}'})
+
+@csrf_exempt
+def api_faculty_stop_session(request, session_id):
+    """API endpoint for faculty to stop their own session"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has faculty or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['faculty', 'admin']:
+            return JsonResponse({'success': False, 'message': 'Faculty or Administrator privileges required'})
+        
+        try:
+            session = AttendanceSession.objects.get(id=session_id)
+            
+            # Check if faculty is authorized to stop this session
+            if user_role == 'faculty' and session.faculty != request.user:
+                return JsonResponse({'success': False, 'message': 'You are not authorized to stop this session'})
+            
+            session.is_active = False
+            session.end_time = timezone.now()  # Set end time when stopping session
+            session.save()
+            
+            return JsonResponse({
+                'success': True, 
+                'message': f'Session "{session.name}" stopped successfully',
+                'session_id': session.id
+            })
+            
+        except AttendanceSession.DoesNotExist:
+            return JsonResponse({'success': False, 'message': 'Session not found'})
+        except Exception as e:
+            return JsonResponse({'success': False, 'message': f'Error stopping session: {str(e)}'})
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_faculty_delete_session(request, session_id):
+    """API endpoint for faculty to delete their own session"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has faculty or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['faculty', 'admin']:
+            return JsonResponse({'success': False, 'message': 'Faculty or Administrator privileges required'})
+        
+        try:
+            session = AttendanceSession.objects.get(id=session_id)
+            
+            # Check if faculty is authorized to delete this session
+            if user_role == 'faculty' and session.faculty != request.user:
+                return JsonResponse({'success': False, 'message': 'You are not authorized to delete this session'})
+            
+            session_name = session.name
+            session.delete()
+            
+            return JsonResponse({
+                'success': True, 
+                'message': f'Session "{session_name}" deleted successfully'
+            })
+            
+        except AttendanceSession.DoesNotExist:
+            return JsonResponse({'success': False, 'message': 'Session not found'})
+        except Exception as e:
+            return JsonResponse({'success': False, 'message': f'Error deleting session: {str(e)}'})
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_all_users(request):
+    """API endpoint for admin to get all users"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has admin role
+        if not (request.user.role and request.user.role.name.lower() == 'admin'):
+            return JsonResponse({'success': False, 'message': 'Administrator privileges required'})
+        
+        # Get all users
+        users = User.objects.all()
+        
+        users_data = []
+        for user in users:
+            users_data.append({
+                'id': user.id,
+                'roll_number': user.roll_number,
+                'email': user.email,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+                'role': user.role.name if user.role else None,
+                'face_registered': bool(user.face_encoding),
+                'is_active': user.is_active,
+                'date_joined': user.date_joined.isoformat()
+            })
+        
+        return JsonResponse({
+            'success': True,
+            'users': users_data
+        })
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_students_for_faculty(request):
+    """API endpoint for faculty to get all student users"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has faculty or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['faculty', 'admin']:
+            return JsonResponse({'success': False, 'message': 'Faculty or Administrator privileges required'})
+        
+        # Get student users
+        students = User.objects.filter(role__name='student')
+        
+        students_data = []
+        for student in students:
+            students_data.append({
+                'id': student.id,
+                'roll_number': student.roll_number,
+                'email': student.email,
+                'first_name': student.first_name,
+                'last_name': student.last_name,
+                'role': student.role.name if student.role else None,
+                'face_registered': bool(student.face_encoding),
+                'is_active': student.is_active,
+                'date_joined': student.date_joined.isoformat()
+            })
+        
+        return JsonResponse({
+            'success': True,
+            'students': students_data
+        })
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_faculty_members(request):
+    """API endpoint to get faculty members (for HOD) - filtered by department for HOD users"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has HOD or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['hod', 'admin']:
+            return JsonResponse({'success': False, 'message': 'HOD or Administrator privileges required'})
+        
+        # Get faculty users - filter by department for HOD users
+        faculty_users = User.objects.filter(role__name='faculty')
+        
+        # For HOD users, filter by their department
+        if user_role == 'hod' and hasattr(request.user, 'department'):
+            faculty_users = faculty_users.filter(department=request.user.department)
+        
+        users_data = []
+        for user in faculty_users:
+            users_data.append({
+                'id': user.id,
+                'roll_number': user.roll_number,
+                'email': user.email,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+                'role': user.role.name if user.role else None,
+                'face_registered': bool(user.face_encoding),
+                'is_active': user.is_active,
+                'department': user.department,  # Include department information
+            })
+            
+        return JsonResponse({
+            'success': True,
+            'users': users_data
+        })
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has faculty or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['faculty', 'admin']:
+            return JsonResponse({'success': False, 'message': 'Faculty or Administrator privileges required'})
+        
+        # Get all students (users with role 'student')
+        students = User.objects.filter(role__name='student')
+        
+        students_data = []      
+        for student in students:
+            students_data.append({
+                'id': student.id,
+                'roll_number': student.roll_number,
+                'email': student.email,
+                'first_name': student.first_name,
+                'last_name': student.last_name,
+                'face_registered': bool(student.face_encoding),
+                'is_active': student.is_active,
+            })
+        
+        return JsonResponse({
+            'success': True,
+            'students': students_data
+        })
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_faculty_session_attendance(request, session_id):
+    """API endpoint to get attendance records for a specific faculty session"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has faculty or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['faculty', 'admin']:
+            return JsonResponse({'success': False, 'message': 'Faculty or Administrator privileges required'})
+        
+        try:
+            # Get the specific session
+            session = AttendanceSession.objects.get(id=session_id)
+            
+            # Check if faculty is authorized to access this session
+            if user_role == 'faculty' and session.faculty != request.user:
+                return JsonResponse({'success': False, 'message': 'You are not authorized to access this session'})
+            
+            # Get students based on session's level, department, and target year
+            students = User.objects.filter(role__name='student')
+            
+            # Apply filters based on session attributes
+            if session.level:
+                students = students.filter(level=session.level)
+            if session.department:
+                students = students.filter(department=session.department)
+            if session.target_year:
+                students = students.filter(year=session.target_year)
+            
+            # Get attendance records for this session
+            attendance_records = AttendanceRecord.objects.filter(
+                session=session
+            ).select_related('user')
+            
+            # Create a set of student IDs who attended
+            attended_student_ids = set(record.user.id for record in attendance_records)
+            
+            # Build attendance data for filtered students
+            attendance_data = []
+            for student in students:
+                # Check if this student attended the session
+                is_present = student.id in attended_student_ids
+                
+                attendance_data.append({
+                    'student_id': student.id,
+                    'student_roll_number': student.roll_number,
+                    'student_name': f"{student.first_name} {student.last_name}".strip(),
+                    'is_present': is_present,
+                    'timestamp': next((record.timestamp.isoformat() for record in attendance_records if record.user.id == student.id), None)
+                })
+            
+            return JsonResponse({
+                'success': True,
+                'attendance_data': attendance_data,
+                'session_name': session.name,
+                'total_students': students.count(),
+                'attended_students': len(attended_student_ids)
+            })
+            
+        except AttendanceSession.DoesNotExist:
+            return JsonResponse({'success': False, 'message': 'Session not found'})
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_faculty_attendance_records(request):
+    """API endpoint to get attendance records for all faculty sessions (for HOD)"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has HOD or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['hod', 'admin']:
+            return JsonResponse({'success': False, 'message': 'HOD or Administrator privileges required'})
+        
+        # Get all faculty users
+        faculty_users = User.objects.filter(role__name='faculty')
+        
+        # Get attendance records for all faculty sessions
+        records = AttendanceRecord.objects.filter(
+            session__faculty__in=faculty_users
+        ).select_related('user', 'session').order_by('-timestamp')
+        
+        # Apply filters if provided
+        level = request.GET.get('level')
+        year = request.GET.get('year')
+        department = request.GET.get('department')
+        
+        if level:
+            records = records.filter(session__level=level)
+        if year:
+            records = records.filter(session__target_year=year)
+        if department:
+            records = records.filter(session__department=department)
+        
+        # Build response data
+        records_data = []
+        for record in records:
+            records_data.append({
+                'id': record.id,
+                'user_id': record.user.id,
+                'user_roll_number': record.user.roll_number,
+                'user_name': f"{record.user.first_name} {record.user.last_name}".strip(),
+                'session_id': record.session.id,
+                'session_name': record.session.name,
+                'timestamp': record.timestamp.isoformat(),
+                'level': record.session.level,
+                'year': record.session.target_year,
+                'department': record.session.department,
+                'location_name': record.session.location_constraint.name if record.session.location_constraint else None,
+            })
+        
+        return JsonResponse({
+            'success': True,
+            'records': records_data,
+            'total_records': len(records_data),
+            'filters_applied': {
+                'level': level,
+                'year': year,
+                'department': department,
+            }
+        })
+
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_faculty_attendance_records_by_faculty(request, faculty_id):
+    """API endpoint to get attendance records for a specific faculty member"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has appropriate role (admin, HOD, or the faculty themselves)
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['admin', 'hod'] and request.user.id != faculty_id:
+            return JsonResponse({'success': False, 'message': 'Insufficient privileges'})
+        
+        # Get the faculty user
+        try:
+            faculty_user = User.objects.get(id=faculty_id, role__name='faculty')
+        except User.DoesNotExist:
+            return JsonResponse({'success': False, 'message': 'Faculty not found'})
+        
+        # Get attendance records for this faculty's sessions
+        records = AttendanceRecord.objects.filter(
+            session__faculty=faculty_user
+        ).select_related('user', 'session').order_by('-timestamp')
+        
+        # Apply filters if provided
+        level = request.GET.get('level')
+        year = request.GET.get('year')
+        department = request.GET.get('department')
+        
+        if level:
+            records = records.filter(session__level=level)
+        if year:
+            records = records.filter(session__target_year=year)
+        if department:
+            records = records.filter(session__department=department)
+        
+        # Build response data
+        records_data = []
+        for record in records:
+            records_data.append({
+                'id': record.id,
+                'user_id': record.user.id,
+                'user_roll_number': record.user.roll_number,
+                'user_name': f"{record.user.first_name} {record.user.last_name}".strip(),
+                'session_id': record.session.id,
+                'session_name': record.session.name,
+                'timestamp': record.timestamp.isoformat(),
+                'level': record.session.level,
+                'year': record.session.target_year,
+                'department': record.session.department,
+            })
+        
+        return JsonResponse({
+            'success': True,
+            'records': records_data,
+            'total_records': len(records_data),
+            'faculty': {
+                'id': faculty_user.id,
+                'roll_number': faculty_user.roll_number,
+                'first_name': faculty_user.first_name,
+                'last_name': faculty_user.last_name,
+                'email': faculty_user.email,
+            },
+            'filters_applied': {
+                'level': level,
+                'year': year,
+                'department': department,
+            }
+        })
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_hod_users(request):
+    """API endpoint for HOD to get faculty/students filtered by department, level, and year"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has HOD or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['hod', 'admin']:
+            return JsonResponse({'success': False, 'message': 'HOD or Administrator privileges required'})
+        
+        # Get filter parameters
+        user_type = request.GET.get('user_type')  # 'faculty' or 'student'
+        level = request.GET.get('level')  # 'UG' or 'PG'
+        year = request.GET.get('year')    # '1', '2', '3', '4'
+        department = request.GET.get('department')  # Specific department for PG
+        
+        # For HOD, use their department if not provided (for UG)
+        hod_department = None
+        if user_role == 'hod' and hasattr(request.user, 'department'):
+            hod_department = request.user.department
+        
+        # Build query for users
+        users = User.objects.all()
+        
+        # Filter by user type (role)
+        if user_type == 'faculty':
+            users = users.filter(role__name='faculty')
+        elif user_type == 'student':
+            users = users.filter(role__name='student')
+        else:
+            # If no user type specified, get both faculty and students
+            users = users.filter(role__name__in=['faculty', 'student'])
+        
+        # Apply department filter
+        if user_type == 'faculty' or user_type == 'student':
+            # For UG, use HOD's department
+            if level == 'UG' and hod_department:
+                users = users.filter(department=hod_department, level='UG')
+            # For PG, use specified department
+            elif level == 'PG' and department:
+                users = users.filter(department=department, level='PG')
+            # If no level specified but HOD has department, filter by that
+            elif not level and hod_department:
+                users = users.filter(department=hod_department)
+        
+        # Apply level filter
+        if level:
+            users = users.filter(level=level)
+        
+        # Apply year filter
+        if year:
+            users = users.filter(year=year)
+        
+        # Build response data
+        users_data = []
+        for user in users:
+            users_data.append({
+                'id': user.id,
+                'roll_number': user.roll_number,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+                'email': user.email,
+                'role': user.role.name if user.role else None,
+                'year': user.year,
+                'department': user.department,
+                'level': user.level,
+                'is_active': user.is_active,
+                'date_joined': user.date_joined.isoformat() if user.date_joined else None,
+            })
+        
+        response_data = {
+            'success': True,
+            'users': users_data,
+            'total_users': len(users_data),
+            'filters_applied': {
+                'user_type': user_type,
+                'level': level,
+                'year': year,
+                'department': department,
+                'hod_department': hod_department
+            }
+        }
+        
+        return JsonResponse(response_data)
+            
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error in api_get_hod_users: {str(e)}")
+        print(f"Traceback: {error_details}")
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_hod_filtered_sessions(request):
+    """API endpoint for HOD to get filtered faculty sessions with attendance data"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has HOD or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['hod', 'admin']:
+            return JsonResponse({'success': False, 'message': 'HOD or Administrator privileges required'})
+        
+        # For HOD, get all faculty sessions in their department
+        # For admin, get all faculty sessions
+        if user_role == 'hod':
+            # HOD can view all faculty sessions in their department
+            sessions = AttendanceSession.objects.filter(
+                faculty__role__name='faculty'
+            ).order_by('-start_time')
+            
+            # Apply department filter based on HOD's department
+            # Only apply department filter if HOD has a department set
+            if hasattr(request.user, 'department') and request.user.department:
+                sessions = sessions.filter(department=request.user.department)
+                print(f"HOD department filter applied: {request.user.department}")
+            else:
+                print("HOD has no department set, showing all faculty sessions")
+        else:
+            # Admin gets all faculty sessions
+            sessions = AttendanceSession.objects.filter(
+                faculty__role__name='faculty'
+            ).order_by('-start_time')
+        
+        # Apply filters if provided
+        level = request.GET.get('level')
+        year = request.GET.get('year')
+        
+        # Apply level filter
+        print(f"Applying filters - Level: {level}, Year: {year}")
+        original_count = sessions.count()
+        print(f"Sessions before filtering: {original_count}")
+        
+        if level:
+            sessions = sessions.filter(level=level)
+            print(f"Sessions after level filter: {sessions.count()}")
+            
+            # For UG level, years are 1, 2, 3, 4
+            # For PG level, years are 1, 2
+            if level == 'UG':
+                if year and year in ['1', '2', '3', '4']:
+                    sessions = sessions.filter(target_year=year)
+                    print(f"Sessions after UG year filter: {sessions.count()}")
+                elif year:
+                    # Invalid year for UG, return empty result
+                    print(f"Invalid UG year {year}, returning empty result")
+                    sessions = AttendanceSession.objects.none()
+            elif level == 'PG':
+                if year and year in ['1', '2']:
+                    sessions = sessions.filter(target_year=year)
+                    print(f"Sessions after PG year filter: {sessions.count()}")
+                elif year:
+                    # Invalid year for PG, return empty result
+                    print(f"Invalid PG year {year}, returning empty result")
+                    sessions = AttendanceSession.objects.none()
+        elif year:
+            # If no level specified but year is specified, filter by year
+            sessions = sessions.filter(target_year=year)
+            print(f"Sessions after year filter (no level): {sessions.count()}")
+
+        sessions_data = []
+
+        for session in sessions:
+            # Get attendance records for this session
+            attendance_records = AttendanceRecord.objects.filter(session=session)
+            
+            # Create a set of student IDs who attended this session
+            attended_student_ids = set(record.user.id for record in attendance_records)
+            
+            # Get students based on session's level, department, and target year
+            students = User.objects.filter(role__name='student')
+            
+            # Apply filters based on session attributes
+            if session.level:
+                students = students.filter(level=session.level)
+            if session.department:
+                students = students.filter(department=session.department)
+            if session.target_year:
+                students = students.filter(year=session.target_year)
+            
+            # Build attendance data for filtered students
+            student_attendance = []
+            for student in students:
+                # Check if this student attended the session
+                is_present = student.id in attended_student_ids
+                
+                student_attendance.append({
+                    'student_id': student.id,
+                    'student_roll_number': student.roll_number,
+                    'student_name': f"{student.first_name} {student.last_name}".strip(),
+                    'is_present': is_present,
+                    'timestamp': next((record.timestamp.isoformat() for record in attendance_records if record.user.id == student.id), None)
+                })
+            
+            sessions_data.append({
+                'id': session.id,
+                'name': session.name,
+                'location_constraint': {
+                    'id': session.location_constraint.id if session.location_constraint else None,
+                    'name': session.location_constraint.name if session.location_constraint else None,
+                    'latitude': str(session.location_constraint.latitude) if session.location_constraint and session.location_constraint.latitude else None,
+                    'longitude': str(session.location_constraint.longitude) if session.location_constraint and session.location_constraint.longitude else None,
+                    'radius': str(session.location_constraint.radius) if session.location_constraint and session.location_constraint.radius else None
+                },
+                'start_time': session.start_time.astimezone(pytz.timezone('Asia/Kolkata')).isoformat() if session.start_time else None,
+                'end_time': session.end_time.astimezone(pytz.timezone('Asia/Kolkata')).isoformat() if session.end_time else None,
+                'is_active': session.is_active,
+                'duration_minutes': int((session.end_time - session.start_time).total_seconds() / 60) if session.start_time and session.end_time else 0,
+                'target_year': session.target_year,
+                'level': session.level,
+                'department': session.department,
+                'student_attendance': student_attendance,
+                'total_students': students.count(),
+                'attended_students': len([s for s in student_attendance if s['is_present']])
+            })
+        
+        final_count = len(sessions_data)
+        print(f"Final sessions data count: {final_count}")
+        
+        # Debug: Print session names and IDs
+        for session_data in sessions_data:
+            print(f"Session ID: {session_data['id']}, Name: {session_data['name']}")
+        
+        # Group sessions by name and keep only the most recent one for each name
+        grouped_sessions = {}
+        for session_data in sessions_data:
+            session_name = session_data['name']
+            session_start_time = session_data['start_time']
+            
+            if session_name not in grouped_sessions:
+                grouped_sessions[session_name] = session_data
+            else:
+                # Compare start times to keep the most recent session
+                existing_session = grouped_sessions[session_name]
+                existing_start_time = existing_session['start_time']
+                
+                # Parse the datetime strings for comparison
+                try:
+                    from datetime import datetime
+                    if session_start_time and existing_start_time:
+                        session_time = datetime.fromisoformat(session_start_time.replace('Z', '+00:00'))
+                        existing_time = datetime.fromisoformat(existing_start_time.replace('Z', '+00:00'))
+                        
+                        # Keep the more recent session
+                        if session_time > existing_time:
+                            grouped_sessions[session_name] = session_data
+                except Exception as e:
+                    print(f"Error comparing session times: {e}")
+                    # If there's an error in comparison, keep the existing one
+                    pass
+        
+        # Convert grouped sessions back to a list
+        unique_sessions = list(grouped_sessions.values())
+        print(f"Unique sessions count after deduplication: {len(unique_sessions)}")
+        
+        response_data = {
+            'success': True,
+            'sessions': unique_sessions,  # Return deduplicated sessions
+            'total_sessions': len(unique_sessions),
+            'filters_applied': {
+                'level': level,
+                'year': year,
+                'department': request.user.department if user_role == 'hod' and hasattr(request.user, 'department') else None
+            }
+        }
+        
+        print(f"Sending response with {len(unique_sessions)} unique sessions")
+        return JsonResponse(response_data)
+            
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error in api_get_hod_filtered_sessions: {str(e)}")
+        print(f"Traceback: {error_details}")
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_hod_dashboard_stats(request):
+    """API endpoint to get HOD dashboard statistics - filtered by department for HOD users"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has HOD or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['hod', 'admin']:
+            return JsonResponse({'success': False, 'message': 'HOD or Administrator privileges required'})
+        
+        # Initialize querysets
+        faculty_users = User.objects.filter(role__name='faculty')
+        faculty_sessions = AttendanceSession.objects.filter(faculty__role__name='faculty')
+        faculty_attendance_records = AttendanceRecord.objects.filter(session__faculty__role__name='faculty')
+        
+        # For HOD users, filter by their department
+        if user_role == 'hod' and hasattr(request.user, 'department'):
+            faculty_users = faculty_users.filter(department=request.user.department)
+            faculty_sessions = faculty_sessions.filter(department=request.user.department)
+            # For attendance records, filter by faculty's department
+            faculty_attendance_records = faculty_attendance_records.filter(session__faculty__department=request.user.department)
+        
+        # Get statistics
+        total_faculty = faculty_users.count()
+        
+        # For total sessions, filter by today's date
+        today = timezone.now().date()
+        total_sessions = faculty_sessions.filter(start_time__date=today).count()
+        
+        # For active sessions, filter by today's date and active status
+        active_sessions = faculty_sessions.filter(start_time__date=today, is_active=True).count()
+        
+        # For total attendance records, filter by today's date
+        total_attendance_records = faculty_attendance_records.filter(timestamp__date=today).count()
+        
+        return JsonResponse({
+            'success': True,
+            'stats': {
+                'total_faculty': total_faculty,
+                'total_sessions': total_sessions,
+                'active_sessions': active_sessions,
+                'total_attendance_records': total_attendance_records
+            }
+        })
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_faculty_daily_attendance(request):
+    """API endpoint for faculty to get attendance records for a specific date"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has faculty or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['faculty', 'admin']:
+            return JsonResponse({'success': False, 'message': 'Faculty or Administrator privileges required'})
+        
+        # Get date parameter
+        date_str = request.GET.get('date')
+        if not date_str:
+            return JsonResponse({'success': False, 'message': 'Date parameter is required'})
+        
+        try:
+            # Parse the date
+            target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        except ValueError:
+            return JsonResponse({'success': False, 'message': 'Invalid date format. Use YYYY-MM-DD'})
+        
+        # Get sessions for this faculty member on the specified date
+        sessions = AttendanceSession.objects.filter(
+            faculty=request.user,
+            start_time__date=target_date
+        ).order_by('start_time')
+        
+        # Get all students
+        students = User.objects.filter(role__name='student')
+        
+        # Prepare data structure
+        sessions_data = []
+        
+        # Build sessions with attendance data
+        for session in sessions:
+            # Get attendance records for this session
+            attendance_records = AttendanceRecord.objects.filter(session=session)
+            
+            # Create a set of student IDs who attended this session
+            attended_student_ids = set(record.user.id for record in attendance_records)
+            
+            # Build attendance status for each student
+            student_attendance = []
+            for student in students:
+                is_present = student.id in attended_student_ids
+                student_attendance.append({
+                    'student_id': student.id,
+                    'student_roll_number': student.roll_number,
+                    'student_name': f"{student.first_name} {student.last_name}".strip(),
+                    'is_present': is_present,
+                    'timestamp': next((record.timestamp.isoformat() for record in attendance_records if record.user.id == student.id), None)
+                })
+            
+            sessions_data.append({
+                'id': session.id,
+                'name': session.name,
+                'start_time': session.start_time.isoformat() if session.start_time else None,
+                'end_time': session.end_time.isoformat() if session.end_time else None,
+                'is_active': session.is_active,
+                'student_attendance': student_attendance,
+                'total_students': students.count(),
+                'attended_students': len(attended_student_ids)
+            })
+        
+        return JsonResponse({
+            'success': True,
+            'date': target_date.isoformat(),
+            'sessions': sessions_data,
+            'total_sessions': sessions.count()
+        })
+            
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error in api_get_faculty_daily_attendance: {str(e)}")
+        print(f"Traceback: {error_details}")
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+
+@csrf_exempt
+def api_get_filtered_faculty_daily_attendance(request):
+    """API endpoint for faculty/HOD to get filtered attendance records for a specific date based on level, department, and year"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has faculty, admin, or HOD role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['faculty', 'admin', 'hod']:
+            return JsonResponse({'success': False, 'message': 'Faculty, Administrator, or HOD privileges required'})
+        
+        # Get parameters
+        date_str = request.GET.get('date')
+        level = request.GET.get('level')
+        department = request.GET.get('department')
+        year = request.GET.get('year')
+        
+        # Check if department parameter was explicitly provided
+        department_provided = 'department' in request.GET
+        
+        if not date_str:
+            return JsonResponse({'success': False, 'message': 'Date parameter is required'})
+        
+        try:
+            # Parse the date
+            target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        except ValueError:
+            return JsonResponse({'success': False, 'message': 'Invalid date format. Use YYYY-MM-DD'})
+        
+        # Get sessions based on user role
+        if user_role == 'hod':
+            # For HOD, get all faculty sessions in their department on the specified date
+            sessions = AttendanceSession.objects.filter(
+                faculty__role__name='faculty',
+                start_time__date=target_date
+            ).order_by('start_time')
+            
+            # Apply department filter based on HOD's department
+            if hasattr(request.user, 'department') and request.user.department:
+                sessions = sessions.filter(department=request.user.department)
+        else:
+            # For faculty/admin, get sessions for this specific user on the specified date
+            sessions = AttendanceSession.objects.filter(
+                faculty=request.user,
+                start_time__date=target_date
+            ).order_by('start_time')
+        
+        # Apply filters based on level, department, and year
+        if level:
+            sessions = sessions.filter(level=level)
+        if department_provided and department:  # Only filter if department parameter was provided and has a value
+            sessions = sessions.filter(department=department)
+        if year:
+            sessions = sessions.filter(target_year=year)
+        
+        # Get students based on the same filters
+        students = User.objects.filter(role__name='student')
+        
+        if user_role == 'hod':
+            # For HOD, show all students in their department
+            if hasattr(request.user, 'department') and request.user.department:
+                students = students.filter(department=request.user.department)
+            
+            # Apply filters based on level and year
+            if level:
+                students = students.filter(level=level)
+            if year:
+                students = students.filter(year=year)
+        elif user_role == 'faculty' and request.user.level == 'UG' and request.user.department:
+            # For UG faculty, restrict to their assigned department when viewing UG level
+            if level == 'UG':
+                # UG faculty viewing UG level - restrict to their department
+                # Apply this restriction regardless of other filters
+                print(f"UG faculty {request.user.roll_number} viewing UG level, restricting to department: {request.user.department}")
+                students = students.filter(department=request.user.department, level='UG')
+                # Apply year filter if provided
+                if year:
+                    students = students.filter(year=year)
+            elif level == 'PG':
+                # UG faculty viewing PG level - they can select any PG department
+                if department_provided and department:
+                    students = students.filter(department=department, level='PG')
+                else:
+                    students = students.filter(level='PG')
+                # Apply year filter if provided
+                if year:
+                    students = students.filter(year=year)
+            else:
+                # No level selected - default to faculty's assigned department and UG level
+                students = students.filter(department=request.user.department, level='UG')
+                # Apply year filter if provided
+                if year:
+                    students = students.filter(year=year)
+        else:
+            # For PG faculty or when no specific restrictions apply, use the provided filters
+            if level:
+                students = students.filter(level=level)
+            if department_provided and department:
+                students = students.filter(department=department)
+            if year:
+                students = students.filter(year=year)
+        
+        # Prepare data structure
+        sessions_data = []
+        
+        # Build sessions with attendance data
+        for session in sessions:
+            # Get attendance records for this session
+            attendance_records = AttendanceRecord.objects.filter(session=session)
+            
+            # Create a set of student IDs who attended this session
+            attended_student_ids = set(record.user.id for record in attendance_records)
+            
+            # Build attendance status for each student
+            # Only include students who belong to this session's department and level
+            student_attendance = []
+            for student in students:
+                # For UG faculty viewing UG level, we've already filtered students to their department
+                # For all cases, ensure students match the session's level and department
+                if student.level == session.level and student.department == session.department:
+                    is_present = student.id in attended_student_ids
+                    student_attendance.append({
+                        'student_id': student.id,
+                        'student_roll_number': student.roll_number,
+                        'student_name': f"{student.first_name} {student.last_name}".strip(),
+                        'is_present': is_present,
+                        'timestamp': next((record.timestamp.isoformat() for record in attendance_records if record.user.id == student.id), None)
+                    })
+            
+            sessions_data.append({
+                'id': session.id,
+                'name': session.name,
+                'start_time': session.start_time.isoformat() if session.start_time else None,
+                'end_time': session.end_time.isoformat() if session.end_time else None,
+                'is_active': session.is_active,
+                'level': session.level,
+                'department': session.department,
+                'target_year': session.target_year,
+                'student_attendance': student_attendance,
+                'total_students': len(student_attendance),
+                'attended_students': len([s for s in student_attendance if s['is_present']])
+            })
+        
+        return JsonResponse({
+            'success': True,
+            'date': target_date.isoformat(),
+            'sessions': sessions_data,
+            'total_sessions': sessions.count(),
+            'filters_applied': {
+                'level': level,
+                'department': department,
+                'year': year
+            }
+        })
+            
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error in api_get_filtered_faculty_daily_attendance: {str(e)}")
+        print(f"Traceback: {error_details}")
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+
+@csrf_exempt
+def api_get_faculty_members(request):
+    """API endpoint to get faculty members (for HOD) - filtered by department for HOD users"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has HOD or admin role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['hod', 'admin']:
+            return JsonResponse({'success': False, 'message': 'HOD or Administrator privileges required'})
+        
+        # Get faculty users - filter by department for HOD users
+        faculty_users = User.objects.filter(role__name='faculty')
+        
+        # For HOD users, filter by their department
+        if user_role == 'hod' and hasattr(request.user, 'department'):
+            faculty_users = faculty_users.filter(department=request.user.department)
+        
+        users_data = []
+        for user in faculty_users:
+            users_data.append({
+                'id': user.id,
+                'roll_number': user.roll_number,
+                'email': user.email,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+                'role': user.role.name if user.role else None,
+                'face_registered': bool(user.face_encoding),
+                'is_active': user.is_active,
+                'department': user.department,  # Include department information
+            })
+            
+        return JsonResponse({
+            'success': True,
+            'users': users_data
+        })
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_logout(request):
+    """API endpoint for user logout"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Logout the user
+        logout(request)
+        
+        return JsonResponse({
+            'success': True,
+            'message': 'Logged out successfully'
+        })
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_create_user(request):
+    """API endpoint for admin to create a new user"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has admin or HOD role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['admin', 'hod']:
+            return JsonResponse({'success': False, 'message': 'Administrator or HOD privileges required'})
+        
+        data = json.loads(request.body)
+        roll_number = data.get('roll_number')
+        email = data.get('email')
+        first_name = data.get('first_name', '')
+        last_name = data.get('last_name', '')
+        password = data.get('password')
+        role_id = data.get('role_id')
+        year = data.get('year')  # Get year
+        department = data.get('department')  # Get department
+        level = data.get('level')  # Get level
+        
+        if not all([roll_number, email, password]):
+            return JsonResponse({'success': False, 'message': 'Roll number, email, and password are required'})
+        
+        # Check if user already exists
+        if User.objects.filter(roll_number=roll_number).exists():
+            return JsonResponse({'success': False, 'message': 'User with this roll number already exists'})
+        
+        if User.objects.filter(email=email).exists():
+            return JsonResponse({'success': False, 'message': 'User with this email already exists'})
+        
+        try:
+            # Create user
+            user = User.objects.create_user(
+                username=roll_number,
+                roll_number=roll_number,
+                email=email,
+                first_name=first_name,
+                last_name=last_name,
+                password=password
+            )
+            
+            # Set year, department, and level if provided
+            if year:
+                user.year = year
+            if department:
+                user.department = department
+            if level:
+                user.level = level
+            
+            # Assign role if provided
+            if role_id:
+                try:
+                    role = Role.objects.get(id=role_id)
+                    user.role = role
+                except Role.DoesNotExist:
+                    pass  # Role not found, continue without assigning role
+            
+            user.save()
+            
+            # Send email notification to user with their details
+            try:
+                from .utils import send_user_details_email
+                send_user_details_email(user, 'created', password)
+            except Exception as email_error:
+                print(f"Failed to send email notification: {email_error}")
+            
+            return JsonResponse({
+                'success': True, 
+                'message': f'User "{roll_number}" created successfully',
+                'user_id': user.id
+            })
+            
+        except Exception as e:
+            return JsonResponse({'success': False, 'message': f'Error creating user: {str(e)}'})
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_update_user(request, user_id):
+    """API endpoint for admin/HOD to update a user"""
+    if request.method != 'PUT':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has admin or HOD role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['admin', 'hod']:
+            return JsonResponse({'success': False, 'message': 'Administrator or HOD privileges required'})
+        
+        try:
+            user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return JsonResponse({'success': False, 'message': 'User not found'})
+        
+        data = json.loads(request.body)
+        email = data.get('email')
+        first_name = data.get('first_name')
+        last_name = data.get('last_name')
+        role_id = data.get('role_id')
+        is_active = data.get('is_active')
+        level = data.get('level')
+        year = data.get('year')
+        department = data.get('department')
+        
+        # Update user fields if provided
+        if email:
+            # Check if email is already taken by another user
+            if User.objects.filter(email=email).exclude(id=user_id).exists():
+                return JsonResponse({'success': False, 'message': 'Email already taken by another user'})
+            user.email = email
+            
+        if first_name is not None:
+            user.first_name = first_name
+            
+        if last_name is not None:
+            user.last_name = last_name
+            
+        if is_active is not None:
+            user.is_active = is_active
+            
+        # Update level, year, and department if provided
+        if level is not None:
+            user.level = level
+            
+        if year is not None:
+            user.year = year
+            
+        if department is not None:
+            user.department = department
+            
+        # Assign role if provided
+        if role_id:
+            try:
+                role = Role.objects.get(id=role_id)
+                user.role = role
+            except Role.DoesNotExist:
+                return JsonResponse({'success': False, 'message': 'Role not found'})
+        
+        user.save()
+        
+        # Send email notification to user with their updated details
+        try:
+            from .utils import send_user_details_email
+            send_user_details_email(user, 'updated')
+        except Exception as email_error:
+            print(f"Failed to send email notification: {email_error}")
+        
+        return JsonResponse({
+            'success': True, 
+            'message': f'User "{user.roll_number}" updated successfully'
+        })
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_delete_user(request, user_id):
+    """API endpoint for admin/HOD to delete a user"""
+    if request.method != 'DELETE':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has admin or HOD role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['admin', 'hod']:
+            return JsonResponse({'success': False, 'message': 'Administrator or HOD privileges required'})
+        
+        try:
+            user = User.objects.get(id=user_id)
+            
+            # Prevent deleting the admin user
+            if user.role and user.role.name.lower() == 'admin' and user.id == request.user.id:
+                return JsonResponse({'success': False, 'message': 'Cannot delete your own admin account'})
+            
+            roll_number = user.roll_number
+            user.delete()
+            
+            return JsonResponse({
+                'success': True, 
+                'message': f'User "{roll_number}" deleted successfully'
+            })
+            
+        except User.DoesNotExist:
+            return JsonResponse({'success': False, 'message': 'User not found'})
+        except Exception as e:
+            return JsonResponse({'success': False, 'message': f'Error deleting user: {str(e)}'})
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_all_users(request):
+    """API endpoint for admin to get all users"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has admin role
+        if not (request.user.role and request.user.role.name.lower() == 'admin'):
+            return JsonResponse({'success': False, 'message': 'Administrator privileges required'})
+        
+        # Get all users
+        users = User.objects.all()
+        
+        users_data = []
+        for user in users:
+            users_data.append({
+                'id': user.id,
+                'roll_number': user.roll_number,
+                'email': user.email,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+                'role': {
+                    'id': user.role.id if user.role else None,
+                    'name': user.role.name if user.role else None
+                },
+                'face_registered': bool(user.face_encoding),
+                'is_active': user.is_active,
+                'date_joined': user.date_joined.isoformat(),
+                'year': user.year,  # Add year
+                'department': user.department,  # Add department
+            })
+        
+        return JsonResponse({
+            'success': True,
+            'users': users_data
+        })
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_registered_faces(request):
+    """API endpoint for admin/HOD to get registered faces with filtering by department for HOD users"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has admin or HOD role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role not in ['admin', 'hod']:
+            return JsonResponse({'success': False, 'message': 'Administrator or HOD privileges required'})
+        
+        # Get all users with registered faces
+        users_with_faces = User.objects.exclude(face_encoding__isnull=True).exclude(face_encoding='')
+        
+        # For HOD users, filter by their department
+        if user_role == 'hod' and hasattr(request.user, 'department'):
+            users_with_faces = users_with_faces.filter(department=request.user.department)
+        
+        faces_data = []
+        for user in users_with_faces:
+            faces_data.append({
+                'user_id': user.id,
+                'roll_number': user.roll_number,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+                'email': user.email,
+                'date_registered': user.date_joined.isoformat(),
+                'face_image': user.face_image,  # Include face image data
+                'department': user.department,  # Include department information
+                'level': user.level,  # Include level information
+                'year': user.year,  # Include year information
+            })
+        
+        return JsonResponse({
+            'success': True,
+            'faces': faces_data
+        })
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_hod_filtered_registered_faces(request):
+    """API endpoint for HOD to get registered faces with filtering by level and year"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has HOD role
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        if user_role != 'hod':
+            return JsonResponse({'success': False, 'message': 'HOD privileges required'})
+        
+        # Get parameters
+        level = request.GET.get('level')
+        year = request.GET.get('year')
+        department = request.GET.get('department')
+        
+        # Get users with registered faces
+        users_with_faces = User.objects.exclude(face_encoding__isnull=True).exclude(face_encoding='')
+        
+        # Get all users (for counting unregistered users)
+        all_users = User.objects.all()
+        
+        # Filter by HOD's department
+        if hasattr(request.user, 'department') and request.user.department:
+            users_with_faces = users_with_faces.filter(department=request.user.department)
+            all_users = all_users.filter(department=request.user.department)
+        
+        # Apply filters
+        if level:
+            users_with_faces = users_with_faces.filter(level=level)
+            all_users = all_users.filter(level=level)
+        if year:
+            users_with_faces = users_with_faces.filter(year=year)
+            all_users = all_users.filter(year=year)
+        if department:
+            users_with_faces = users_with_faces.filter(department=department)
+            all_users = all_users.filter(department=department)
+        
+        # Count registered and unregistered users
+        registered_count = users_with_faces.count()
+        total_count = all_users.count()
+        unregistered_count = total_count - registered_count
+        
+        faces_data = []
+        for user in users_with_faces:
+            faces_data.append({
+                'user_id': user.id,
+                'roll_number': user.roll_number,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+                'email': user.email,
+                'date_registered': user.date_joined.isoformat(),
+                'face_image': user.face_image,
+                'department': user.department,
+                'level': user.level,
+                'year': user.year,
+            })
+        
+        return JsonResponse({
+            'success': True,
+            'faces': faces_data,
+            'registered_count': registered_count,
+            'unregistered_count': unregistered_count,
+            'total_count': total_count,
+            'filters_applied': {
+                'level': level,
+                'year': year,
+                'department': department
+            }
+        })
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_all_sessions(request):
+    """API endpoint to get all sessions"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Get all sessions ordered by start time
+        sessions = AttendanceSession.objects.all().order_by('-start_time')
+        
+        sessions_data = []
+        for session in sessions:
+            sessions_data.append({
+                'id': session.id,
+                'name': session.name,
+                'location_constraint': {
+                    'id': session.location_constraint.id,
+                    'name': session.location_constraint.name,
+                    'latitude': str(session.location_constraint.latitude),
+                    'longitude': str(session.location_constraint.longitude),
+                    'radius': str(session.location_constraint.radius)
+                },
+                'start_time': session.start_time.isoformat() if session.start_time else None,
+                'end_time': session.end_time.isoformat() if session.end_time else None,
+                'is_active': session.is_active,
+                'faculty': {
+                    'id': session.faculty.id,
+                    'name': f"{session.faculty.first_name} {session.faculty.last_name}".strip() if session.faculty else "Unknown"
+                } if session.faculty else None
+            })
+        
+        return JsonResponse({
+            'success': True,
+            'sessions': sessions_data
+        })
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_active_sessions(request):
+    """API endpoint to get active sessions only"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Get only active sessions ordered by start time
+        sessions = AttendanceSession.objects.filter(is_active=True).order_by('-start_time')
+        
+        # Filter sessions based on user's role, level, year, and department
+        user_role = request.user.role.name.lower() if request.user.role else ''
+        
+        # For students, only show sessions targeted to their level, year, and department
+        if user_role == 'student':
+            # Filter by level if available
+            if request.user.level:
+                sessions = sessions.filter(level=request.user.level)
+            
+            # Filter by year if available
+            if request.user.year:
+                sessions = sessions.filter(target_year=request.user.year)
+            
+            # Filter by department if available
+            if request.user.department:
+                sessions = sessions.filter(department=request.user.department)
+        
+        sessions_data = []
+        for session in sessions:
+            sessions_data.append({
+                'id': session.id,
+                'name': session.name,
+                'start_time': session.start_time.isoformat() if session.start_time else None,
+                'end_time': session.end_time.isoformat() if session.end_time else None,
+                'is_active': session.is_active,
+                'faculty': {
+                    'id': session.faculty.id,
+                    'name': f"{session.faculty.first_name} {session.faculty.last_name}".strip() if session.faculty else "Unknown"
+                } if session.faculty else None,
+                'location_constraint': {
+                    'id': session.location_constraint.id,
+                    'name': session.location_constraint.name,
+                    'latitude': str(session.location_constraint.latitude),
+                    'longitude': str(session.location_constraint.longitude),
+                    'radius': str(session.location_constraint.radius)
+                },
+
+                
+                'target_year': session.target_year,  # Include target year
+                'level': session.level,  # Include level
+                'department': session.department  # Include department
+            })
+        
+        return JsonResponse({
+            'success': True,
+            'sessions': sessions_data
+        })
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_get_all_roles(request):
+    """API endpoint to get all roles"""
+    if request.method != 'GET':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has admin role
+        if not (request.user.role and request.user.role.name.lower() == 'admin' or request.user.role.name.lower() == 'hod'):
+            return JsonResponse({'success': False, 'message': 'Administrator privileges required'})
+        
+        # Get all roles
+        roles = Role.objects.all()
+        
+        roles_data = []
+        for role in roles:
+            roles_data.append({
+                'id': role.id,
+                'name': role.name,
+                'description': role.description
+            })
+        
+        return JsonResponse({
+            'success': True,
+            'roles': roles_data
+        })
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_delete_user_face(request, user_id):
+    """API endpoint for admin to delete a user's face photo"""
+    if request.method != 'DELETE':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        # Check if user has admin role
+        if not (request.user.role and request.user.role.name.lower() == 'admin'):
+            return JsonResponse({'success': False, 'message': 'Administrator privileges required'})
+        
+        # Get the user whose face photo needs to be deleted
+        try:
+            user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return JsonResponse({'success': False, 'message': 'User not found'})
+        
+        # Delete the face encoding and face image
+        user.face_encoding = None
+        user.face_image = None
+        user.save()
+        
+        return JsonResponse({
+            'success': True, 
+            'message': f'Face photo deleted successfully for user {user.roll_number}'
+        })
+            
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})
+
+@csrf_exempt
+def api_calculate_monthly_attendance(request):
+    """API endpoint to calculate monthly attendance for a user"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'message': 'Invalid request method'})
+    
+    try:
+        # Check if user is authenticated
+        if not request.user.is_authenticated:
+            return JsonResponse({'success': False, 'message': 'Authentication required'})
+        
+        data = json.loads(request.body)
+        year = int(data.get('year'))
+        month = int(data.get('month'))
+        
+        # Get the first and last day of the month
+        from datetime import datetime, timedelta
+        import calendar
+        
+        start_date = datetime(year, month, 1)
+        last_day = calendar.monthrange(year, month)[1]
+        end_date = datetime(year, month, last_day, 23, 59, 59)
+        
+        # Get all sessions in this month
+        monthly_sessions = AttendanceSession.objects.filter(
+            start_time__gte=start_date,
+            start_time__lte=end_date
+        )
+        
+        # Get user's attendance records for these sessions
+        user_attendance = AttendanceRecord.objects.filter(
+            user=request.user,
+            session__in=monthly_sessions
+        )
+        
+        # Calculate attendance percentage
+        total_sessions = monthly_sessions.count()
+        attended_sessions = user_attendance.count()
+        
+        attendance_percentage = 0
+        if total_sessions > 0:
+            attendance_percentage = (attended_sessions / total_sessions) * 100
+        
+        # Create or update monthly report
+        from .models import MonthlyReport
+        report, created = MonthlyReport.objects.get_or_create(
+            user=request.user,
+            month=start_date.date().replace(day=1),
+            defaults={
+                'total_sessions': total_sessions,
+                'attended_sessions': attended_sessions,
+                'attendance_percentage': attendance_percentage
+            }
+        )
+        
+        if not created:
+            report.total_sessions = total_sessions
+            report.attended_sessions = attended_sessions
+            report.attendance_percentage = attendance_percentage
+            report.save()
+        
+        return JsonResponse({
+            'success': True,
+            'report': {
+                'month': report.month.strftime('%B %Y'),
+                'total_sessions': report.total_sessions,
+                'attended_sessions': report.attended_sessions,
+                'attendance_percentage': float(report.attendance_percentage)
+            }
+        })
+        
+    except Exception as e:
+        return JsonResponse({'success': False, 'message': f'Error: {str(e)}'})

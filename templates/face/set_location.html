@@ -1,0 +1,204 @@
+{% extends 'face/base.html' %}
+
+{% block title %}Set Location Constraint - Face Recognition Attendance System{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-12">
+        <h2>Set Location Constraint</h2>
+        <hr>
+    </div>
+</div>
+
+<div class="row">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <h5>Location Details</h5>
+            </div>
+            <div class="card-body">
+                <form method="post" id="locationForm">
+                    {% csrf_token %}
+                    <div class="mb-3">
+                        <label for="name" class="form-label">Location Name *</label>
+                        <input type="text" class="form-control" id="name" name="name" required>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="latitude" class="form-label">Latitude *</label>
+                        <input type="text" class="form-control" id="latitude" name="latitude" readonly required>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="longitude" class="form-label">Longitude *</label>
+                        <input type="text" class="form-control" id="longitude" name="longitude" readonly required>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="radius" class="form-label">Radius (meters) *</label>
+                        <input type="number" class="form-control" id="radius" name="radius" min="1" max="10000000" value="300" required>
+                        <div class="form-text">Enter the radius in meters (1-10,000,000). Recommended: 300 meters for better GPS accuracy tolerance.</div>
+                    </div>
+                    
+                    <div class="d-grid gap-2 d-md-flex justify-content-md-end">
+                        <button type="button" class="btn btn-info me-md-2" id="getCurrentLocation">
+                            <span id="locationSpinner" class="spinner-border spinner-border-sm d-none" role="status" aria-hidden="true"></span>
+                            Get Current Location
+                        </button>
+                        <a href="{% url 'face:location_constraint' %}" class="btn btn-secondary me-md-2">Cancel</a>
+                        <button type="submit" class="btn btn-primary">Set Location Constraint</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-header">
+                <h5>Instructions</h5>
+            </div>
+            <div class="card-body">
+                <ol>
+                    <li>Click "Get Current Location" to detect your current position</li>
+                    <li>Enter a name for this location</li>
+                    <li>Set the radius (in meters) for the attendance area</li>
+                    <li>Click "Set Location Constraint" to save</li>
+                </ol>
+                <div class="alert alert-warning">
+                    <strong>Mobile Users:</strong> 
+                    <ul>
+                        <li>Ensure GPS is enabled on your device</li>
+                        <li>Allow location access when prompted</li>
+                        <li>Be patient - location detection may take up to 30 seconds</li>
+                        <li>For better accuracy, try outdoors with clear sky view</li>
+                    </ul>
+                </div>
+                <p class="text-muted">
+                    Note: You need to allow location access in your browser for this feature to work.
+                </p>
+            </div>
+        </div>
+        
+        <div class="card mt-3">
+            <div class="card-header">
+                <h5>Location Status</h5>
+            </div>
+            <div class="card-body">
+                <div id="locationStatus" class="alert alert-info">
+                    Location not detected yet.
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    document.getElementById('getCurrentLocation').addEventListener('click', function() {
+        const button = this;
+        const spinner = document.getElementById('locationSpinner');
+        const statusDiv = document.getElementById('locationStatus');
+        
+        // Show spinner and update button text
+        spinner.classList.remove('d-none');
+        button.disabled = true;
+        button.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Getting Location...';
+        statusDiv.className = 'alert alert-warning';
+        statusDiv.innerHTML = 'Requesting location access... Please be patient, this may take up to 30 seconds on mobile devices.';
+        
+        if (navigator.geolocation) {
+            // Show progress indicator
+            let progressInterval = setInterval(function() {
+                let currentText = statusDiv.innerHTML;
+                if (currentText.includes('...')) {
+                    statusDiv.innerHTML = currentText.replace('...', '');
+                } else {
+                    statusDiv.innerHTML = currentText + '.';
+                }
+            }, 500);
+            
+            navigator.geolocation.getCurrentPosition(
+                function(position) {
+                    // Clear progress indicator
+                    clearInterval(progressInterval);
+                    
+                    // Success
+                    const lat = position.coords.latitude;
+                    const lon = position.coords.longitude;
+                    const accuracy = position.coords.accuracy;
+                    
+                    // Provide feedback based on accuracy
+                    let accuracyMessage = '';
+                    if (accuracy <= 50) {
+                        accuracyMessage = 'Excellent accuracy';
+                    } else if (accuracy <= 100) {
+                        accuracyMessage = 'Good accuracy';
+                    } else if (accuracy <= 300) {
+                        accuracyMessage = 'Fair accuracy';
+                    } else {
+                        accuracyMessage = 'Poor accuracy - consider moving to a better location';
+                    }
+                    
+                    // Update form fields
+                    document.getElementById('latitude').value = lat.toFixed(6);
+                    document.getElementById('longitude').value = lon.toFixed(6);
+                    
+                    // Update status
+                    statusDiv.className = 'alert alert-success';
+                    statusDiv.innerHTML = `Location detected: ${lat.toFixed(6)}, ${lon.toFixed(6)}<br>
+                    <small>Accuracy: ${Math.round(accuracy)} meters (${accuracyMessage})</small>`;
+                    
+                    // Reset button
+                    spinner.classList.add('d-none');
+                    button.disabled = false;
+                    button.innerHTML = '<span id="locationSpinner" class="spinner-border spinner-border-sm d-none" role="status" aria-hidden="true"></span> Get Current Location';
+                },
+                function(error) {
+                    // Clear progress indicator
+                    clearInterval(progressInterval);
+                    
+                    // Error
+                    let errorMessage = '';
+                    switch(error.code) {
+                        case error.PERMISSION_DENIED:
+                            errorMessage = "Location access denied by user. Please enable location permissions for this site.";
+                            break;
+                        case error.POSITION_UNAVAILABLE:
+                            errorMessage = "Location information is unavailable. Please check your device settings.";
+                            break;
+                        case error.TIMEOUT:
+                            errorMessage = "The request to get user location timed out. Please try again or check your GPS signal.";
+                            break;
+                        case error.UNKNOWN_ERROR:
+                            errorMessage = "An unknown error occurred. Please try again.";
+                            break;
+                    }
+                    
+                    // Update status
+                    statusDiv.className = 'alert alert-danger';
+                    statusDiv.innerHTML = `Error: ${errorMessage}`;
+                    
+                    // Reset button
+                    spinner.classList.add('d-none');
+                    button.disabled = false;
+                    button.innerHTML = '<span id="locationSpinner" class="spinner-border spinner-border-sm d-none" role="status" aria-hidden="true"></span> Get Current Location';
+                },
+                {
+                    enableHighAccuracy: true,
+                    timeout: 30000,
+                    maximumAge: 60000
+                }
+            );
+        } else {
+            // Geolocation not supported
+            statusDiv.className = 'alert alert-danger';
+            statusDiv.innerHTML = 'Geolocation is not supported by this browser.';
+            
+            // Reset button
+            spinner.classList.add('d-none');
+            button.disabled = false;
+            button.innerHTML = '<span id="locationSpinner" class="spinner-border spinner-border-sm d-none" role="status" aria-hidden="true"></span> Get Current Location';
+        }
+    });
+</script>
+{% endblock %}

@@ -1,0 +1,249 @@
+{% extends 'face/base.html' %}
+
+{% block title %}Unified Dashboard - Face Recognition Attendance System{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-12">
+        <h2>Unified Dashboard</h2>
+        <hr>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <h5>Welcome, {{ user.get_full_name }} 
+                {% if user.role %}
+                    ({{ user.role.name|title }})
+                {% else %}
+                    (No Role Assigned)
+                {% endif %}
+                </h5>
+            </div>
+            <div class="card-body">
+                <p>This unified dashboard provides quick access to all system functionalities based on your role.</p>
+                
+                {% if user.role %}
+                    {% if user.role.name.lower == 'admin' %}
+                    <div class="alert alert-info">
+                        <strong>Admin Access:</strong> You have full access to all system functionalities.
+                    </div>
+                    {% elif user.role.name.lower == 'hod' %}
+                    <div class="alert alert-info">
+                        <strong>HOD Access:</strong> You can manage department activities and view attendance reports.
+                    </div>
+                    {% elif user.role.name.lower == 'faculty' %}
+                    <div class="alert alert-info">
+                        <strong>Faculty Access:</strong> You can take attendance and view student records.
+                    </div>
+                    {% elif user.role.name.lower == 'principal' %}
+                    <div class="alert alert-info">
+                        <strong>Principal Access:</strong> You have access to comprehensive institutional reports.
+                    </div>
+                    {% else %}
+                    <div class="alert alert-info">
+                        <strong>Student Access:</strong> You can mark attendance and view your records.
+                    </div>
+                    {% endif %}
+                {% else %}
+                    <div class="alert alert-warning">
+                        <strong>No Role Assigned:</strong> Please contact your administrator to assign you a role.
+                    </div>
+                {% endif %}
+                
+                {% if active_session %}
+                    <div class="alert alert-success">
+                        <strong>Active Session:</strong> {{ active_session.name }} is currently active. 
+                        {% if user.role and user.role.name.lower != 'admin' %}
+                            <a href="{% url 'face:mark_attendance' %}" class="btn btn-sm btn-primary">Mark Attendance</a>
+                        {% endif %}
+                    </div>
+                {% else %}
+                    <div class="alert alert-info">
+                        <strong>No Active Session:</strong> Please wait for the admin to start an attendance session.
+                        {% if user.role and user.role.name.lower != 'admin' %}
+                            <a href="{% url 'face:mark_attendance' %}" class="btn btn-sm btn-outline-primary">Check Attendance</a>
+                        {% endif %}
+                    </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <!-- Quick Actions Section -->
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <h5>Quick Actions</h5>
+            </div>
+            <div class="card-body">
+                <div class="row">
+                    {% if user.role and user.role.name.lower != 'admin' %}
+                    <div class="col-md-6 mb-3">
+                        <div class="card h-100">
+                            <div class="card-body text-center">
+                                <h5 class="card-title">My Attendance</h5>
+                                <p class="card-text">Manage your attendance</p>
+                                <a href="{% url 'face:mark_attendance' %}" class="btn btn-primary">Mark Attendance</a>
+                                <a href="{% url 'face:view_attendance' %}" class="btn btn-outline-primary mt-2">View Records</a>
+                                <a href="{% url 'face:register_face' %}" class="btn btn-outline-secondary mt-2">Register Face</a>
+                            </div>
+                        </div>
+                    </div>
+                    {% endif %}
+                    
+                    {% if user.role and user.role.name.lower == 'admin' %}
+                    <div class="col-md-6 mb-3">
+                        <div class="card h-100">
+                            <div class="card-body text-center">
+                                <h5 class="card-title">Attendance Management</h5>
+                                <p class="card-text">Manage attendance sessions</p>
+                                <a href="{% url 'face:manage_sessions' %}" class="btn btn-primary">Manage Sessions</a>
+                                <a href="{% url 'face:create_session' %}" class="btn btn-outline-primary mt-2">Create Session</a>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="col-md-6 mb-3">
+                        <div class="card h-100">
+                            <div class="card-body text-center">
+                                <h5 class="card-title">User Management</h5>
+                                <p class="card-text">Manage system users</p>
+                                <a href="{% url 'face:manage_users' %}" class="btn btn-success">Manage Users</a>
+                                <a href="{% url 'face:create_user' %}" class="btn btn-outline-success mt-2">Create User</a>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="col-md-6 mb-3">
+                        <div class="card h-100">
+                            <div class="card-body text-center">
+                                <h5 class="card-title">Location Settings</h5>
+                                <p class="card-text">Manage location constraints</p>
+                                <a href="{% url 'face:location_constraint' %}" class="btn btn-warning">Location Constraints</a>
+                            </div>
+                        </div>
+                    </div>
+                    {% endif %}
+                    
+                    {% if user.role and user.role.name.lower == 'hod' or user.role.name.lower == 'faculty' %}
+                    <div class="col-md-6 mb-3">
+                        <div class="card h-100">
+                            <div class="card-body text-center">
+                                <h5 class="card-title">My Department</h5>
+                                <p class="card-text">Department activities</p>
+                                <button class="btn btn-info">View Department</button>
+                            </div>
+                        </div>
+                    </div>
+                    {% endif %}
+                    
+                    {% if user.role and user.role.name.lower == 'principal' %}
+                    <div class="col-md-6 mb-3">
+                        <div class="card h-100">
+                            <div class="card-body text-center">
+                                <h5 class="card-title">Institution Reports</h5>
+                                <p class="card-text">Comprehensive analytics</p>
+                                <button class="btn btn-info">View Reports</button>
+                            </div>
+                        </div>
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Navigation Panel -->
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-header">
+                <h5>Role Navigation</h5>
+            </div>
+            <div class="card-body">
+                <div class="d-grid gap-2">
+                    {% if user.role and user.role.name.lower == 'admin' %}
+                    <a href="{% url 'face:admin_dashboard' %}" class="btn btn-primary">Admin Dashboard</a>
+                    {% endif %}
+                    
+                    {% if user.role and user.role.name.lower == 'hod' %}
+                    <a href="{% url 'face:hod_dashboard' %}" class="btn btn-success">HOD Dashboard</a>
+                    {% endif %}
+                    
+                    {% if user.role and user.role.name.lower == 'faculty' %}
+                    <a href="{% url 'face:faculty_dashboard' %}" class="btn btn-warning">Faculty Dashboard</a>
+                    {% endif %}
+                    
+                    {% if user.role and user.role.name.lower == 'principal' %}
+                    <a href="{% url 'face:principal_dashboard' %}" class="btn btn-info">Principal Dashboard</a>
+                    {% endif %}
+                    
+                    <a href="{% url 'face:home' %}" class="btn btn-secondary">Home Page</a>
+                    <a href="{% url 'face:mark_attendance' %}" class="btn btn-outline-primary">Mark Attendance</a>
+                    <a href="{% url 'face:view_attendance' %}" class="btn btn-outline-secondary">View Attendance</a>
+                    
+                    {% if user.role and user.role.name.lower == 'admin' %}
+                    <a href="{% url 'face:manage_users' %}" class="btn btn-outline-success">Manage Users</a>
+                    <a href="{% url 'face:create_user' %}" class="btn btn-outline-warning">Create User</a>
+                    <a href="{% url 'face:location_constraint' %}" class="btn btn-outline-info">Location Constraints</a>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+        
+        <!-- User Information Card -->
+        <div class="card mt-3">
+            <div class="card-header">
+                <h5>Your Information</h5>
+            </div>
+            <div class="card-body">
+                <p><strong>Name:</strong> {{ user.get_full_name }}</p>
+                <p><strong>Roll Number:</strong> {{ user.roll_number }}</p>
+                <p><strong>Email:</strong> {{ user.email }}</p>
+                <p><strong>Role:</strong> 
+                {% if user.role %}
+                    {{ user.role.name|title }}
+                {% else %}
+                    No Role Assigned
+                {% endif %}
+                </p>
+                <p><strong>Last Login:</strong> {{ user.last_login|date:"M d, Y H:i" }}</p>
+                
+                {% if not user.face_encoding %}
+                <div class="alert alert-warning mt-2">
+                    <strong>Face Not Registered:</strong> 
+                    <a href="{% url 'face:register_face' %}" class="btn btn-sm btn-warning">Register Face</a>
+                </div>
+                {% else %}
+                <div class="alert alert-success mt-2">
+                    <strong>Face Registered</strong>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+        
+        <!-- System Credentials Info -->
+        <div class="card mt-3">
+            <div class="card-header">
+                <h5>System Credentials</h5>
+            </div>
+            <div class="card-body">
+                <p><strong>Admin Login:</strong></p>
+                <p class="mb-1">Roll Number: <code>admin</code></p>
+                <p class="mb-1">Password: <code>admin123</code></p>
+                
+                <p class="mt-3"><strong>Creating New Users:</strong></p>
+                <p class="mb-1">1. Go to Admin Dashboard → Manage Users → Create User</p>
+                <p class="mb-1">2. Assign appropriate role (admin, hod, faculty, principal, student)</p>
+                <p class="mb-1">3. Users can then login with their roll number and password</p>
+                
+                <p class="mt-3"><strong>Note:</strong> Contact administrator for account creation.</p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

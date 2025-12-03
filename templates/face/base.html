@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Face Recognition Attendance System{% endblock %}</title>
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Custom CSS -->
+    <style>
+        body {
+            padding-top: 20px;
+            background-color: #f8f9fa;
+        }
+        .navbar-brand {
+            font-weight: bold;
+        }
+        .card {
+            box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
+            border: 1px solid rgba(0, 0, 0, 0.125);
+        }
+        .footer {
+            margin-top: 50px;
+            padding: 20px 0;
+            background-color: #f8f9fa;
+            border-top: 1px solid #dee2e6;
+        }
+    </style>
+    {% block extra_css %}{% endblock %}
+</head>
+<body>
+    <!-- Navigation Bar -->
+    <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+        <div class="container">
+            <a class="navbar-brand" href="{% url 'face:home' %}">Face Recognition Attendance</a>
+            
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav me-auto">
+                    {% if user.is_authenticated %}
+                        <li class="nav-item">
+                            <a class="nav-link" href="{% url 'face:unified_dashboard' %}">Dashboard</a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="{% url 'face:mark_attendance' %}">Mark Attendance</a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="{% url 'face:view_attendance' %}">View Attendance</a>
+                        </li>
+                        
+                        {% if user.role and user.role.name.lower() == 'admin' %}
+                        <li class="nav-item dropdown">
+                            <a class="nav-link dropdown-toggle" href="#" id="adminDropdown" role="button" data-bs-toggle="dropdown">
+                                Admin Panel
+                            </a>
+                            <ul class="dropdown-menu">
+                                <li><a class="dropdown-item" href="{% url 'face:admin_dashboard' %}">Admin Dashboard</a></li>
+                                <li><a class="dropdown-item" href="{% url 'face:manage_users' %}">Manage Users</a></li>
+                                <li><a class="dropdown-item" href="{% url 'face:create_user' %}">Create User</a></li>
+                                <li><a class="dropdown-item" href="{% url 'face:location_constraint' %}">Location Constraints</a></li>
+                            </ul>
+                        </li>
+                        {% endif %}
+                        
+                        {% if user.role and user.role.name.lower() == 'hod' %}
+                        <li class="nav-item">
+                            <a class="nav-link" href="{% url 'face:hod_dashboard' %}">HOD Dashboard</a>
+                        </li>
+                        {% endif %}
+                        
+                        {% if user.role and user.role.name.lower() == 'faculty' %}
+                        <li class="nav-item">
+                            <a class="nav-link" href="{% url 'face:faculty_dashboard' %}">Faculty Dashboard</a>
+                        </li>
+                        {% endif %}
+                        
+                        {% if user.role and user.role.name.lower() == 'principal' %}
+                        <li class="nav-item">
+                            <a class="nav-link" href="{% url 'face:principal_dashboard' %}">Principal Dashboard</a>
+                        </li>
+                        {% endif %}
+                    {% endif %}
+                </ul>
+                
+                <ul class="navbar-nav">
+                    {% if user.is_authenticated %}
+                        <li class="nav-item">
+                            <span class="navbar-text text-white me-3">Welcome, {{ user.first_name }}!</span>
+                        </li>
+                        <li class="nav-item">
+                            <a class="btn btn-outline-light" href="{% url 'face:logout' %}">Logout</a>
+                        </li>
+                    {% else %}
+                        <li class="nav-item">
+                            <a class="btn btn-outline-light" href="{% url 'face:login' %}">Login</a>
+                        </li>
+                    {% endif %}
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <div class="container mt-4">
+        {% if messages %}
+            {% for message in messages %}
+                <div class="alert alert-{{ message.tags }} alert-dismissible fade show" role="alert">
+                    {{ message }}
+                    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                </div>
+            {% endfor %}
+        {% endif %}
+        
+        {% block content %}
+        {% endblock %}
+    </div>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <div class="container text-center">
+            <span class="text-muted">© 2025 Face Recognition Attendance System</span>
+        </div>
+    </footer>
+
+    <!-- Bootstrap JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    {% block extra_js %}{% endblock %}
+</body>
+</html>

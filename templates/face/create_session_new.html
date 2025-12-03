@@ -1,0 +1,51 @@
+{% extends 'face/base.html' %}
+
+{% block title %}Create Session - Face Recognition Attendance System{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-12">
+        <h2>Create Attendance Session</h2>
+        <hr>
+    </div>
+</div>
+
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <h5>Session Details</h5>
+            </div>
+            <div class="card-body">
+                <form method="post">
+                    {% csrf_token %}
+                    <div class="mb-3">
+                        <label for="name" class="form-label">Session Name *</label>
+                        <input type="text" class="form-control" id="name" name="name" required>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="location" class="form-label">Location Constraint *</label>
+                        <select class="form-select" id="location" name="location" required>
+                            <option value="">Select Location</option>
+                            {% for location in locations %}
+                                <option value="{{ location.id }}">{{ location.name }} ({{ location.latitude }}, {{ location.longitude }})</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="duration" class="form-label">Duration (minutes) *</label>
+                        <input type="number" class="form-control" id="duration" name="duration" value="60" min="1" required>
+                    </div>
+                    
+                    <div class="d-grid gap-2 d-md-flex justify-content-md-end">
+                        <a href="{% url 'face:manage_sessions' %}" class="btn btn-secondary me-md-2">Cancel</a>
+                        <button type="submit" class="btn btn-primary">Create Session</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

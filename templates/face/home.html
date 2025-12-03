@@ -1,0 +1,51 @@
+{% extends 'face/base.html' %}
+
+{% block title %}Home - Face Recognition Attendance System{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <h2 class="text-center">Face Recognition Attendance System</h2>
+            </div>
+            <div class="card-body">
+                <p class="lead text-center">
+                    Welcome to the Face Recognition Attendance System. This system allows you to mark your attendance 
+                    using facial recognition technology with location constraints for enhanced security.
+                </p>
+                
+                {% if user.is_authenticated %}
+                    <div class="text-center mt-4">
+                        <a href="{% url 'face:unified_dashboard' %}" class="btn btn-primary btn-lg me-2">Unified Dashboard</a>
+                        <a href="{% url 'face:mark_attendance' %}" class="btn btn-secondary btn-lg">Mark Attendance</a>
+                        <a href="{% url 'face:view_attendance' %}" class="btn btn-info btn-lg">View Attendance</a>
+                    </div>
+                    
+                    {% if user.role.name.lower == 'admin' %}
+                    <div class="text-center mt-3">
+                        <a href="{% url 'face:admin_dashboard' %}" class="btn btn-warning btn-lg">Admin Dashboard</a>
+                    </div>
+                    {% endif %}
+                {% else %}
+                    <div class="text-center mt-4">
+                        <a href="{% url 'face:login' %}" class="btn btn-primary btn-lg">Login to Continue</a>
+                    </div>
+                {% endif %}
+                
+                <div class="mt-5">
+                    <h4>Features:</h4>
+                    <ul>
+                        <li>Facial recognition-based attendance marking</li>
+                        <li>Location-constrained attendance (GPS-based)</li>
+                        <li>Email notifications for attendance records</li>
+                        <li>Monthly attendance reports via email</li>
+                        <li>Role-based dashboards (Admin, HOD, Faculty, Principal)</li>
+                        <li>Secure authentication with roll number as login ID</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
