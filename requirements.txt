@@ -1,0 +1,5 @@
+Django>=4.2
+django-cors-headers>=4.3
+opencv-python>=4.10
+face-recognition>=1.3
+gunicorn>=21.2   # for production server
