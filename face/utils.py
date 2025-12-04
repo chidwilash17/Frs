@@ -7,13 +7,17 @@ import cv2
 import os
 from datetime import datetime, date
 import json
-import face_recognition
+import mediapipe as mp
 
 def encode_face(image):
     """
-    Encode a face image into a feature vector using the face_recognition library
+    Encode a face image into a feature vector using MediaPipe
     """
     try:
+        # Initialize MediaPipe Face Detection
+        mp_face_detection = mp.solutions.face_detection
+        mp_face_mesh = mp.solutions.face_mesh
+        
         # Convert image to RGB if it's in BGR format (OpenCV uses BGR)
         if len(image.shape) == 3 and image.shape[2] == 3:
             rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -21,33 +25,56 @@ def encode_face(image):
             # If grayscale, convert to RGB
             rgb_image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
         
-        # Detect faces in the image using HOG model (faster) first
-        face_locations = face_recognition.face_locations(rgb_image, model="hog")
-        
-        # If no faces found with HOG, try CNN model (more accurate but slower)
-        if not face_locations:
-            face_locations = face_recognition.face_locations(rgb_image, model="cnn")
-        
-        # If still no faces found, try with upsampling
-        if not face_locations:
-            face_locations = face_recognition.face_locations(rgb_image, number_of_times_to_upsample=2)
+        # Detect faces using MediaPipe
+        with mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5) as face_detection:
+            results = face_detection.process(rgb_image)
         
         # If no faces detected, return None
-        if not face_locations:
+        if not results.detections:
             print("No faces detected in the image")
             return None
         
         # Use the first detected face
-        top, right, bottom, left = face_locations[0]
+        detection = results.detections[0]
+        bbox = detection.location_data.relative_bounding_box
         
-        # Extract face encoding
-        face_encodings = face_recognition.face_encodings(rgb_image, [face_locations[0]])
+        # Get image dimensions
+        h, w, _ = image.shape
         
-        if not face_encodings:
-            print("Could not encode face")
+        # Convert normalized coordinates to pixel values
+        x = int(bbox.xmin * w)
+        y = int(bbox.ymin * h)
+        width = int(bbox.width * w)
+        height = int(bbox.height * h)
+        
+        # Ensure coordinates are within image bounds
+        x = max(0, x)
+        y = max(0, y)
+        width = min(w - x, width)
+        height = min(h - y, height)
+        
+        # Extract face region
+        face_image = image[y:y+height, x:x+width]
+        
+        # Generate a simple encoding based on facial landmarks
+        # Initialize MediaPipe Face Mesh for landmark detection
+        with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True,
+                                  min_detection_confidence=0.5) as face_mesh:
+            landmarks_results = face_mesh.process(cv2.cvtColor(face_image, cv2.COLOR_BGR2RGB))
+        
+        if not landmarks_results.multi_face_landmarks:
+            print("Could not extract face landmarks")
             return None
-            
-        encoding = face_encodings[0]
+        
+        # Create a simple encoding from landmarks
+        # We'll flatten the landmark coordinates to create a feature vector
+        face_landmarks = landmarks_results.multi_face_landmarks[0]
+        encoding = []
+        for landmark in face_landmarks.landmark:
+            encoding.extend([landmark.x, landmark.y, landmark.z])
+        
+        # Convert to numpy array
+        encoding = np.array(encoding, dtype=np.float32)
         print(f"Face encoding shape: {encoding.shape}")
         return encoding
         
@@ -89,7 +116,7 @@ def base64_to_image(base64_string):
 
 def compare_faces(known_encoding, unknown_encoding, tolerance=0.4):
     """
-    Compare two face encodings using the face_recognition library with stricter tolerance
+    Compare two face encodings using MediaPipe approach with stricter tolerance
     """
     try:
         # Check if encodings are valid
@@ -102,22 +129,22 @@ def compare_faces(known_encoding, unknown_encoding, tolerance=0.4):
             print(f"Encoding shape mismatch: known {known_encoding.shape}, unknown {unknown_encoding.shape}")
             return False
             
-        # Use face_recognition's compare_faces function with stricter tolerance
-        matches = face_recognition.compare_faces([known_encoding], unknown_encoding, tolerance=tolerance)
+        # Calculate Euclidean distance between encodings
+        # For MediaPipe landmarks, we'll use a normalized distance
+        distance = np.linalg.norm(known_encoding - unknown_encoding)
         
-        match_result = matches[0] if matches else False
+        # Normalize the distance (since landmark coordinates are normalized between 0-1)
+        # The maximum possible distance would be sqrt(number_of_points * 3) 
+        # (3 for x,y,z coordinates)
+        max_possible_distance = np.sqrt(len(known_encoding) / 3 * 3)  # Simplified
+        normalized_distance = distance / max_possible_distance
+        
+        # Consider faces matching if normalized distance is below tolerance
+        match_result = normalized_distance <= tolerance
+        
         print(f"Face comparison result: {match_result} with tolerance {tolerance}")
+        print(f"Face distance: {distance}, Normalized: {normalized_distance}")
         
-        # Also calculate the distance for additional verification
-        face_distances = face_recognition.face_distance([known_encoding], unknown_encoding)
-        distance = face_distances[0] if len(face_distances) > 0 else 1.0
-        print(f"Face distance: {distance}")
-        
-        # Even if compare_faces says True, double-check with distance
-        if match_result and distance > tolerance:
-            print(f"Warning: compare_faces returned True but distance {distance} > tolerance {tolerance}")
-            return False
-            
         return match_result
     except Exception as e:
         print(f"Error comparing faces: {e}")
@@ -127,7 +154,7 @@ def compare_faces(known_encoding, unknown_encoding, tolerance=0.4):
 
 def is_live_capture(image):
     """
-    Enhanced liveness detection to prevent spoofing with static images
+    Enhanced liveness detection to prevent spoofing with static images using MediaPipe
     """
     try:
         # Check if image is valid
@@ -147,22 +174,30 @@ def is_live_capture(image):
             print(f"Image too blurry (variance: {laplacian_var}), likely not live")
             return False
             
-        # 2. Detect faces first
-        face_locations = face_recognition.face_locations(image)
-        if not face_locations:
+        # 2. Detect faces first using MediaPipe
+        mp_face_detection = mp.solutions.face_detection
+        with mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5) as face_detection:
+            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            results = face_detection.process(rgb_image)
+        
+        if not results.detections:
             print("No faces detected for liveness check")
             return False
             
-        # 3. Check for eye regions and potential blink detection
+        # 3. Check for eye regions using MediaPipe Face Mesh
         # This is a simplified check - in production, you'd want more sophisticated blink detection
-        face_landmarks_list = face_recognition.face_landmarks(image)
-        if not face_landmarks_list:
+        mp_face_mesh = mp.solutions.face_mesh
+        with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True,
+                                  min_detection_confidence=0.5) as face_mesh:
+            landmarks_results = face_mesh.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        
+        if not landmarks_results.multi_face_landmarks:
             print("No face landmarks detected")
             return False
             
         # 4. Check for multiple faces (photos of screens often show multiple faces)
-        if len(face_locations) > 1:
-            print(f"Multiple faces detected ({len(face_locations)}), likely not live")
+        if len(results.detections) > 1:
+            print(f"Multiple faces detected ({len(results.detections)}), likely not live")
             return False
             
         # 5. Check image metadata patterns that suggest it's a photo of a screen
